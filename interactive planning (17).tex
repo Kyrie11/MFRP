@@ -1,0 +1,1117 @@
+\documentclass[10pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,amsfonts,amsthm,mathtools,bm}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage{array}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage{microtype}
+\usepackage{hyperref}
+\usepackage[backend=biber,style=authoryear,maxcitenames=2,maxbibnames=99,natbib=true]{biblatex}
+\addbibresource{interactive_planning_revised.bib}
+
+\hypersetup{
+    colorlinks=true,
+    linkcolor=blue,
+    citecolor=blue,
+    urlcolor=blue
+}
+
+\newcommand{\framework}{MFRP}
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\Prob}{\mathbb{P}}
+\newcommand{\ind}{\mathbf{1}}
+\newcommand{\cA}{\mathcal{A}}
+\newcommand{\cC}{\mathcal{C}}
+\newcommand{\cD}{\mathcal{D}}
+\newcommand{\cG}{\mathcal{G}}
+\newcommand{\cL}{\mathcal{L}}
+\newcommand{\cM}{\mathcal{M}}
+\newcommand{\cN}{\mathcal{N}}
+\newcommand{\cP}{\mathcal{P}}
+\newcommand{\cQ}{\mathcal{Q}}
+\newcommand{\cS}{\mathcal{S}}
+\newcommand{\cU}{\mathcal{U}}
+\newcommand{\cZ}{\mathcal{Z}}
+\newcommand{\R}{\mathbb{R}}
+
+\newtheorem{proposition}{Proposition}
+\setlength{\emergencystretch}{3em}
+
+\title{Learning Intervention-Response Surfaces for Non-Coercive Autonomous Driving}
+\author{Anonymous Authors}
+\date{}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+In dense traffic, a collision-free ego rollout can be safe for two very different reasons: the ego leaves enough interaction margin, or another road user is forced into late, high-burden ceding. Standard ego-conditioned predictors and risk-aware planners can score the resulting future, but they rarely expose the response mechanism that makes the future safe. This creates a false-safe failure mode in which a planner accepts maneuvers whose feasibility is paid for by another agent's hard braking, delay, or loss of priority.
+
+We propose \framework{} (\emph{Mechanism-Feasible Response Planning}), a framework for learning same-root intervention-response surfaces for non-coercive autonomous driving. For each observed scene and relevant agent, \framework{} represents the agent's response as a queryable operator from structured ego interventions to distributions over response branch, induced burden, branch-conditioned motion, and signed safety margin. The operator is deployable from the scene alone, but is trained with same-root support/query intervention groups generated in simulation so that one latent mechanism must explain how responses change across nearby ego timing, gap, speed, and commitment choices. From this surface, \framework{} derives a counterfactual forced-dependence witness: a candidate is coercive only when ego safety is high under high-pressure ceding but low under plausible non-ceding responses, after accounting for local priority. Planning is then performed by selecting from a calibrated mechanism-feasible set rather than by adding a generic pressure penalty to a task cost. The result is an interaction planner that attributes why a candidate is safe, separates comfortable cooperation from coerced yielding, and provides explicit surface evidence for rejecting false-safe ego maneuvers.
+\end{abstract}
+
+\section{Introduction}
+
+Autonomous driving in ordinary traffic is not a single-agent collision-avoidance problem. Around dense merges, lane changes, unprotected turns, and ambiguous-priority intersections, the ego vehicle changes the future options of nearby drivers. A small shift in entry time, target gap, speed, or lateral commitment can determine whether another agent keeps priority, yields early, brakes late, accelerates through, or becomes unable to avoid the ego. The practical question is therefore not only whether an ego candidate has a low predicted collision rate, but also \emph{why} it is predicted to be safe.
+
+This distinction matters because safety can be socially displaced. A lane-change candidate may look safe because the rear vehicle smoothly opens a gap, or because the ego has already committed so aggressively that the rear vehicle must brake hard to avoid a crash. Both futures may be collision-free, and both may contain some form of ceding, but they should not be treated as equivalent. Penalizing every ceding response would be too conservative, since cooperative low-burden yielding is a normal part of traffic. Ignoring the reason for ceding is too permissive, since it can make the planner prefer maneuvers that are safe only when another driver absorbs excessive burden. We call the latter case \emph{forced dependence}: ego feasibility depends on a high-pressure ceding branch, while plausible non-ceding branches are unsafe.
+
+Existing interactive driving methods provide important pieces of this problem. Ego-conditioned prediction and joint prediction--planning models condition surrounding-agent forecasts on ego proposals or learned planning costs \parencite{song2020pip,huang2024dtpp,chen2024ppad,yu2025hype}. Interactive prediction and game-theoretic models reason about influencer--reactor relations, iterative response, or joint futures \parencite{sun2022m2i,huang2023gameformer}. Behavior-latent and social-style models represent driver intent, aggressiveness, or semantic behavior modes \parencite{hu2023formulating,chen2025categorical,deng2025social,zheng2025world4drive}. These methods capture that futures are coupled, but their primary outputs are still candidate-wise trajectories, occupancies, risks, costs, modes, or policy beliefs. They can estimate whether a candidate future is bad; they do not directly model the \emph{same-root response function} that maps nearby ego interventions to how the same agent's response changes.
+
+The missing object is a response surface. For a fixed observed root scene, all counterfactual ego candidates should share the same observation prefix, map context, traffic-control state, route context, and surrounding-agent histories; only the ego intervention changes. A planner should be able to ask: if the ego enters this gap \(0.4\,\mathrm{s}\) later, or reduces entry speed, does the other agent still need to brake? Does safety remain under non-ceding behavior? Is the current candidate sitting on a response boundary where tiny changes flip priority or safety? A candidate-wise predictor answers these questions only by independent re-scoring. A same-root intervention-response surface answers them as queries to one learned mechanism.
+
+We introduce \framework{} (\emph{Mechanism-Feasible Response Planning}) to learn and use this surface. \framework{} treats each relevant agent's response as a scene-conditioned interventional operator over ego candidates. The operator maps structured intervention coordinates---including trajectory/control features, conflict-entry timing, entry speed, gap, yield margin, and priority cues---to response branch, induced burden, motion, and signed safety margin. During training, simulator-generated same-root intervention groups are split into support and query sets; the model must infer one mechanism from support probes and predict held-out interventions. At deployment, the same surface is amortized from the scene alone, without access to future probes.
+
+The learned surface is then used for planning by attribution rather than by cost stacking. \framework{} estimates branch-conditioned safety under ceding and non-ceding responses, the burden of ceding, local priority, uncertainty, and surface sensitivity. A candidate is rejected when its calibrated mechanism risk is high, when it is too uncertain or boundary-sensitive to trust, or when it is safe primarily through high-pressure ceding by another agent. This formulation separates three cases that are often conflated: unsafe ego behavior, comfortable cooperation, and coercive false safety.
+
+Our contributions are:
+\begin{itemize}[leftmargin=*]
+    \item \textbf{Same-root intervention-response surfaces.} We formulate interactive driving prediction as a function-level problem: for a fixed root scene and agent, learn a queryable map from ego interventions to response branch, induced burden, branch-conditioned motion, and safety margin.
+    \item \textbf{Mechanism-token operator learning.} We introduce a deployable scene-only mechanism operator trained with support/query intervention groups, distribution matching from support-adapted to scene-only tokens, and local geometry supervision so that nearby interventions have coherent response changes.
+    \item \textbf{Forced-dependence mechanism-feasible planning.} We define coercion as branch-conditioned safety dependence on high-burden ceding under limited ego priority, and select ego candidates from a calibrated feasible set that also accounts for uncertainty and local response-boundary sensitivity.
+\end{itemize}
+
+
+\section{Related Work}
+
+\subsection{Ego-conditioned prediction and prediction--planning coupling}
+Ego-conditioned prediction methods condition the forecast of surrounding agents on a proposed ego plan. PiP predicts agent trajectories given a planned ego trajectory \parencite{song2020pip}; DTPP jointly trains ego-conditioned prediction and context-aware cost evaluation for tree policy planning \parencite{huang2024dtpp}; PPAD iterates between prediction and planning interactions \parencite{chen2024ppad}; and HYPE combines learned ego proposals, ego-conditioned occupancy prediction, and search-based refinement \parencite{yu2025hype}. These methods are strong baselines because they explicitly condition futures on ego behavior. Their limitation for our problem is that they generally evaluate candidates one by one. \framework{} instead learns a shared same-root response surface, which lets the planner compare a candidate with neighboring interventions and ask whether its safety is robust or only obtained through another agent's high-burden response.
+
+\subsection{Interactive reasoning, game models, and behavior latents}
+Interactive forecasting methods model how agents influence each other. M2I decomposes prediction into influencer and reactor roles \parencite{sun2022m2i}, while GameFormer uses hierarchical game-theoretic Transformer decoding for iterative interaction prediction and planning \parencite{huang2023gameformer}. Driver-style, social, and behavior-latent approaches encode intent, aggressiveness, or latent world state \parencite{hu2023formulating,chen2025categorical,deng2025social,hao2026styledrive,zheng2025world4drive}. These representations are useful for describing what an agent may do in a scene. Our focus is different: for the same root scene, we model how the agent's response distribution changes as the ego intervention changes. This turns interaction reasoning into a queryable counterfactual object and supports branch-conditioned safety attribution.
+
+\subsection{Risk-aware, social, and closed-loop planning}
+Risk-aware and contingency planners optimize for safety under multi-modal futures or policy beliefs \parencite{mustafa2024racp}, and integrated prediction--planning systems learn costs or joint plans in interactive settings \parencite{huang2023differentiable,chen2023interactive}. Social and aggressiveness-aware planners encourage human-compatible behavior \parencite{crosato2024social,hu2023formulating}. Closed-loop resources such as WOMD, Waymax, WOSAC, nuPlan, and CARLA make it possible to evaluate interaction behavior beyond open-loop displacement \parencite{ettinger2021large,gulino2023waymax,montali2023waymo,caesar2021nuplan,dosovitskiy2017carla}. \framework{} is complementary to these lines: it does not replace collision risk, contingency planning, or closed-loop evaluation, but adds a mechanism-level criterion for whether a low-risk plan is non-coercive.
+
+The mechanism-token architecture borrows standard machinery from conditional neural processes, attentive neural processes, Set Transformers, slot attention, and neural operators \parencite{garnelo2018conditional,kim2019attentive,lee2019set,locatello2020object,kovachki2023neural}. The novelty is not the attention module itself, but the driving-specific supervised object: same-root intervention groups, branch-conditioned burden and safety, forced-dependence labels, and planning through a calibrated mechanism-feasible set.
+
+\begin{table}[t]
+\centering
+\caption{Conceptual distinction from representative related work. ``Surface'' denotes a same-root query function from ego interventions to response branch, burden, branch-conditioned safety, and motion.}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{lcccc}
+\toprule
+Method family & Ego-conditioned & Shared response surface & Burden / pressure & Forced-dependence planning \\
+\midrule
+PiP / DTPP / PPAD / HYPE & Yes & No or implicit & No & No \\
+M2I / GameFormer & Partly & No or implicit & No & No \\
+Behavior-latent / social-style models & No or partly & No & Partly & No \\
+Risk-aware / contingency planners & Partly & No & Usually no & No \\
+\framework{} & Yes & Yes & Yes & Yes \\
+\bottomrule
+\end{tabular}}
+\label{tab:related_distinction}
+\end{table}
+
+
+\section{Method}
+\label{sec:method}
+
+\framework{} learns a response mechanism for each relevant surrounding agent and uses that mechanism to select ego candidates that are both safe and non-coercive. The method has three parts: a scene-conditioned interventional response operator, a forced-dependence coercion witness derived from that operator, and a mechanism-feasible selector that optimizes nominal driving objectives only inside a calibrated feasible set.
+
+Let \(s\) denote the observed root scene at planning time \(t_0\), including the map, traffic controls, the ego history, surrounding-agent histories, and route context. Let \(i\in\cA(s)\) index a relevant surrounding agent. An ego candidate \(u\in\cU(s)\) is a finite-horizon intervention over ego states or controls. The random response primitive of agent \(i\) under intervention \(u\) is denoted \(O_i(u)\). The goal is not only to predict \(O_i(u)\) for one candidate, but to learn a shared function that can be queried across many counterfactual ego interventions in the same root scene.
+
+\subsection{Response Mechanism as a Scene-Conditioned Interventional Operator}
+\label{sec:method_response_mechanism}
+
+For a scene--agent pair \((s,i)\), we define the response mechanism as
+\begin{equation}
+    \cM_{s,i}:\quad
+    u \mapsto p\!\left(O_i(u)\mid s,\operatorname{do}(U=u)\right),
+    \label{eq:response_operator}
+\end{equation}
+where \(\operatorname{do}(U=u)\) means that the ego is forced to execute candidate \(u\) while the observed root scene \(s\) is held fixed. The operator is represented by latent mechanism tokens \(\Omega_{s,i}\):
+\begin{equation}
+    p_\theta\!\left(O_i(u)\mid s\right)
+    =
+    D_\theta\!\left(a_i(u;s),\Omega_{s,i}\right),
+    \qquad
+    \Omega_{s,i}\sim q_\phi(\Omega\mid s,i),
+    \label{eq:latent_mechanism}
+\end{equation}
+where \(a_i(u;s)\) is an interaction-aware coordinate for querying the operator.
+
+The response primitive is
+\begin{equation}
+    O_i(u)
+    =
+    \Big(
+    M_i(u),\,
+    Y_i(u),\,
+    \Delta B_i(u),\,
+    H_i(u)
+    \Big).
+    \label{eq:response_primitive}
+\end{equation}
+Here \(M_i(u)\) is a discrete response branch, \(Y_i(u)\) is the future trajectory, \(\Delta B_i(u)\) is a baseline-relative induced burden, and \(H_i(u)\) is a signed safety margin. Branches encode interaction modes such as keeping priority, ceding, braking, accelerating, passing, or non-conflict. Burden is relative to a neutral same-root baseline, so it measures additional delay, deceleration, jerk, or path deviation induced by the ego intervention rather than the absolute discomfort of the agent. The margin is positive when the realized ego--agent pair remains separated and negative when their boxes overlap or violate a signed safety margin.
+
+This representation enforces three properties. It is \emph{queryable}: after \(\Omega_{s,i}\) is inferred, the decoder can evaluate arbitrary candidates and local perturbations. It is \emph{cross-intervention consistent}: one mechanism token must explain a family of interventions from the same root scene. It is \emph{locally geometric}: nearby intervention coordinates should induce coherent changes in branch, burden, motion, and margin. This operator view is related to neural processes and neural operators, but the function domain here is ego-intervention space and the function value is an interactive driving response \parencite{garnelo2018conditional,kim2019attentive,kovachki2023neural}.
+
+\subsection{Mechanism Token Operator}
+\label{sec:method_token_operator}
+
+\paragraph{Scene-conditioned intervention probes.}
+During training, we construct same-root intervention probes:
+\begin{equation}
+    \cP_{s,i}
+    =
+    \left\{
+    \left(u^k,o_i^{k,r}\right)
+    :
+    k=1,\ldots,K,\; r=1,\ldots,R_k
+    \right\},
+    \qquad
+    o_i^{k,r}\sim \cM_{s,i}(u^k).
+    \label{eq:probe_set}
+\end{equation}
+All probes share the same root scene and initial simulator state. The index \(r\) denotes repeated rollouts, simulator seeds, or reactive-policy variants; it is needed whenever branch-conditioned safety under ceding and non-ceding responses is estimated from data. We split probes by intervention into a support set \(\cS_{s,i}\) and a query set \(\cQ_{s,i}\):
+\begin{equation}
+    \cS_{s,i}\cup \cQ_{s,i}=\cP_{s,i},
+    \qquad
+    \cS_{s,i}\cap \cQ_{s,i}=\varnothing.
+\end{equation}
+The support set is available only during training. It teaches the model what a same-root response function looks like; deployment uses the scene-only token.
+
+\paragraph{Interaction-aware intervention coordinates.}
+A raw ego trajectory is insufficient to expose why an agent reacts. We lift each candidate into
+\begin{equation}
+    a_i(u;s)
+    =
+    \Big[
+    e_{\mathrm{traj}}(u),\,
+    \tau_i^{\mathrm{in}}(u),\,
+    \tau_i^{\mathrm{out}}(u),\,
+    g_i(u),\,
+    v^{\mathrm{entry}}(u),\,
+    m_i^{\mathrm{yield}}(u),\,
+    p_i^{\mathrm{prio}}(u),\,
+    e_{\mathrm{ctx}}(s,i,u)
+    \Big].
+    \label{eq:intervention_coordinate}
+\end{equation}
+The coordinate contains a learned trajectory/control embedding \(e_{\mathrm{traj}}\), ego entry and exit times through the conflict region, entry-time gap \(g_i\), ego entry speed, a yield-margin feature, a priority score \(p_i^{\mathrm{prio}}\), and a contextual residual embedding. The priority score summarizes lane right-of-way, traffic lights or stop signs, route alignment, and neutral-baseline ordering; high values mean the ego has stronger local priority, so ceding by the other agent is less likely to be coercive.
+
+\paragraph{Tokenization.}
+A scene encoder produces contextual tokens
+\begin{equation}
+    H_{s,i}
+    =
+    E_\phi^{\mathrm{scene}}
+    \left(
+    X_{\mathrm{map}},
+    X_{\mathrm{tl}},
+    X_{\mathrm{ego}},
+    X_{\mathrm{agents}},
+    i
+    \right),
+    \label{eq:scene_tokens}
+\end{equation}
+where all dynamic tokens are expressed in the ego frame at \(t_0\). Support probes are encoded as a permutation-invariant set:
+\begin{equation}
+    h^{k,r}_{s,i}
+    =
+    E_\phi^{\mathrm{probe}}
+    \left(
+    a_i(u^k;s),\,
+    e_O(o_i^{k,r})
+    \right),
+    \qquad
+    (u^k,o_i^{k,r})\in\cS_{s,i}.
+    \label{eq:probe_tokens}
+\end{equation}
+A fixed bank of learned slots \(\Lambda_i=\{\lambda_i^\ell\}_{\ell=1}^{L}\) cross-attends to scene and probe tokens:
+\begin{align}
+    \Omega_{s,i}^{\cS}
+    &=
+    \operatorname{SlotCrossAttn}_\phi
+    \left(
+    \Lambda_i,\,
+    H_{s,i}\cup\{h^{k,r}_{s,i}:(u^k,o_i^{k,r})\in\cS_{s,i}\}
+    \right),
+    \label{eq:support_mechanism}\\
+    \Omega_{s,i}^{0}
+    &=
+    \operatorname{SlotCrossAttn}_\phi
+    \left(
+    \Lambda_i,\,
+    H_{s,i}
+    \right).
+    \label{eq:scene_only_mechanism}
+\end{align}
+The support-adapted token \(\Omega_{s,i}^{\cS}\) is a training-time teacher; the scene-only token \(\Omega_{s,i}^{0}\) is used at test time. The architecture follows the standard idea of set/slot-based latent arrays for permutation-invariant support aggregation and query-conditioned decoding \parencite{lee2019set,locatello2020object,jaegle2021perceiver}.
+
+\paragraph{Queryable decoder.}
+For a candidate \(u\), the query coordinate attends to the mechanism token:
+\begin{equation}
+    r_i(u)
+    =
+    \operatorname{CrossAttn}_\theta
+    \left(
+    a_i(u;s),\Omega_{s,i}
+    \right).
+    \label{eq:query_response_state}
+\end{equation}
+The response distribution is factorized as
+\begin{equation}
+\begin{aligned}
+    p_\theta(O_i(u)\mid s,\Omega_{s,i})
+    &=
+    p_\theta(M_i\mid r_i(u))\,
+    p_\theta(Y_i\mid M_i,r_i(u)) \\
+    &\quad\times
+    p_\theta(\Delta B_i\mid M_i,Y_i,r_i(u))\,
+    p_\theta(H_i\mid u,Y_i,r_i(u)).
+\end{aligned}
+\label{eq:response_factorization}
+\end{equation}
+The factorization is deliberate: the coercion witness needs branch-conditioned safety and branch-conditioned burden, which would be hidden inside a single black-box risk score.
+
+\paragraph{Operator learning objective.}
+The primary objective is a functional query likelihood:
+\begin{equation}
+    \mathcal L_{\mathrm{mech}}
+    =
+    \E_{s,i,\cS,\cQ}
+    \sum_{(u^q,o_i^{q,r})\in\cQ_{s,i}}
+    -
+    \log
+    p_\theta
+    \left(
+    o_i^{q,r}
+    \mid
+    a_i(u^q;s),s,\Omega_{s,i}^{\cS}
+    \right).
+    \label{eq:mechanism_likelihood}
+\end{equation}
+To make the deployable scene-only token inherit the support-adapted response surface, we match the two predictive distributions:
+\begin{equation}
+    \mathcal L_{\mathrm{distill}}
+    =
+    \E_{s,i,u}
+    \operatorname{KL}
+    \left[
+    p_\theta(O_i(u)\mid s,\Omega_{s,i}^{\cS})
+    \,\Vert\,
+    p_\theta(O_i(u)\mid s,\Omega_{s,i}^{0})
+    \right].
+    \label{eq:distillation_loss}
+\end{equation}
+Finally, to make the surface coherent under continuous perturbations, we use a geometry objective. Let \(d_O(o^a,o^b)\) be a normalized semimetric over branch distributions, trajectories, burden, and margin; let \(D_p\) be a symmetric distance between predicted response distributions. Then
+\begin{equation}
+    \mathcal L_{\mathrm{geo}}
+    =
+    \E_{s,i,(a,b)}
+    \left|
+    D_p
+    \left(
+    p_\theta(O_i(u^a)\mid s,\Omega_{s,i}^{\cS}),
+    p_\theta(O_i(u^b)\mid s,\Omega_{s,i}^{\cS})
+    \right)
+    -
+    d_O(o_i^a,o_i^b)
+    \right|.
+    \label{eq:geometry_loss}
+\end{equation}
+The operator loss is
+\begin{equation}
+    \mathcal L_{\mathrm{op}}
+    =
+    \mathcal L_{\mathrm{mech}}
+    +
+    \lambda_d\mathcal L_{\mathrm{distill}}
+    +
+    \lambda_g\mathcal L_{\mathrm{geo}}.
+    \label{eq:operator_loss}
+\end{equation}
+
+\subsection{Counterfactual Coercion Witness}
+\label{sec:method_coercion_witness}
+
+Let \(\cC_i\) be the set of branches in which agent \(i\) cedes priority to the ego, including yielding, hard braking, or delayed conflict-region entry. For a candidate \(u\), define
+\begin{align}
+    S_i^{\cC}(u)
+    &=
+    \Prob_\theta
+    \left(
+    H_i(u)>0
+    \mid
+    M_i(u)\in\cC_i,\,
+    s,\Omega_{s,i}
+    \right),
+    \label{eq:cede_safety}\\
+    S_i^{\bar{\cC}}(u)
+    &=
+    \Prob_\theta
+    \left(
+    H_i(u)>0
+    \mid
+    M_i(u)\notin\cC_i,\,
+    s,\Omega_{s,i}
+    \right),
+    \label{eq:noncede_safety}\\
+    B_i^{\cC}(u)
+    &=
+    \E_\theta
+    \left[
+    \Delta B_i(u)
+    \mid
+    M_i(u)\in\cC_i,\,
+    s,\Omega_{s,i}
+    \right].
+    \label{eq:cede_burden}
+\end{align}
+Safety dependence on ceding is
+\begin{equation}
+    D_i^{\cC}(u)
+    =
+    \left[
+    S_i^{\cC}(u)
+    -
+    S_i^{\bar{\cC}}(u)
+    \right]_+.
+    \label{eq:safety_dependence}
+\end{equation}
+A high ceding probability alone is not coercion, and high burden alone is not enough. Coercion requires that high-burden ceding is what makes the ego candidate safe, especially when the ego lacks clear local priority.
+
+The coercion witness is
+\begin{equation}
+    \kappa_i(u)
+    =
+    \Prob_\psi
+    \left(
+    Z_i^{\mathrm{coer}}(u)=1
+    \mid
+    s,u,\Omega_{s,i}
+    \right),
+    \label{eq:coercion_witness}
+\end{equation}
+where \(Z_i^{\mathrm{coer}}(u)\) denotes that \(u\) is feasible only through a high-burden ceding response by agent \(i\). The witness head receives mechanism-derived summaries:
+\begin{equation}
+    \zeta_i(u)
+    =
+    \Big[
+    \Prob_\theta(M_i\in\cC_i\mid u),\,
+    S_i^{\cC}(u),\,
+    S_i^{\bar{\cC}}(u),\,
+    D_i^{\cC}(u),\,
+    B_i^{\cC}(u),\,
+    p_i^{\mathrm{prio}}(u),\,
+    r_i(u)
+    \Big],
+    \label{eq:witness_features}
+\end{equation}
+and is parameterized as
+\begin{equation}
+    \kappa_i(u)=g_\psi^{\mathrm{mono}}\!\left(\zeta_i(u)\right).
+    \label{eq:monotone_witness_head}
+\end{equation}
+The head is monotone in ceding probability, \(D_i^{\cC}\), and \(B_i^{\cC}\), anti-monotone in \(p_i^{\mathrm{prio}}\), and flexible in the latent response embedding.
+
+The witness is trained with soft event labels and pairwise rankings extracted from intervention probes:
+\begin{equation}
+    \mathcal L_{\mathrm{cw\text{-}event}}
+    =
+    -
+    \E_{s,i,u}
+    w_i(u)
+    \left[
+    \tilde z_i(u)\log \kappa_i(u)
+    +
+    \left(1-\tilde z_i(u)\right)
+    \log\left(1-\kappa_i(u)\right)
+    \right],
+    \label{eq:cw_event_loss}
+\end{equation}
+where \(w_i(u)\) downweights candidates without enough ceding and non-ceding evidence. For ordered pairs \((u^+,u^-)\in\mathcal R_{s,i}\), where \(u^+\) has stronger probe evidence of forced dependence than \(u^-\), we use
+\begin{equation}
+    \mathcal L_{\mathrm{cw\text{-}rank}}
+    =
+    \E_{(u^+,u^-)\in\mathcal R_{s,i}}
+    \left[
+    \delta_{\mathrm{cw}}
+    -
+    \kappa_i(u^+)
+    +
+    \kappa_i(u^-)
+    \right]_+.
+    \label{eq:cw_rank_loss}
+\end{equation}
+The witness loss is
+\begin{equation}
+    \mathcal L_{\mathrm{cw}}
+    =
+    \mathcal L_{\mathrm{cw\text{-}event}}
+    +
+    \lambda_r\mathcal L_{\mathrm{cw\text{-}rank}}.
+    \label{eq:cw_loss}
+\end{equation}
+
+\subsection{Mechanism-Feasible Planning}
+\label{sec:method_feasible_planning}
+
+Given candidate \(u\), let \(O(u)=\{O_i(u)\}_{i\in\cA(s)}\). The mechanism violation event is
+\begin{equation}
+    V(u,O)
+    =
+    \ind
+    \left[
+    \exists i\in\cA(s):
+    H_i(u)<0
+    \;\lor\;
+    Z_i^{\mathrm{coer}}(u)=1
+    \right].
+    \label{eq:mechanism_violation_event}
+\end{equation}
+Thus a candidate is infeasible if it is unsafe under plausible responses or if its apparent safety depends on coercive high-burden ceding. The mechanism risk is
+\begin{equation}
+    \rho_{\mathrm{mech}}(u)
+    =
+    \E_{O\sim \cM_s(u)}
+    \left[
+    V(u,O)
+    \right],
+    \qquad
+    \cM_s(u)=\{\cM_{s,i}(u)\}_{i\in\cA(s)}.
+    \label{eq:mechanism_risk}
+\end{equation}
+In practice, we estimate \(\rho_{\mathrm{mech}}\) by sampling from the decoder or by aggregating branch-conditioned unsafe and coercive probabilities.
+
+We also compute two reliability diagnostics. The first is predictive uncertainty,
+\begin{equation}
+    \nu(u)
+    =
+    \max_{i\in\cA(s)}
+    \left[
+    \mathbb H\!\left(p_\theta(M_i\mid u)\right)
+    +
+    \operatorname{Var}_\theta(H_i(u))
+    +
+    \operatorname{Var}_{m=1}^{M}\!\left(\kappa_i^{(m)}(u)\right)
+    \right],
+    \label{eq:uncertainty_diagnostic}
+\end{equation}
+where the last term is estimated with ensembles, dropout, or stochastic mechanism samples. The second is local surface sensitivity,
+\begin{equation}
+    \gamma(u)
+    =
+    \max_{i\in\cA(s)}
+    \max_{u'\in\cN(u)}
+    \frac{
+    D_p\!\left(
+    p_\theta(O_i(u)\mid s,\Omega_{s,i}^{0}),
+    p_\theta(O_i(u')\mid s,\Omega_{s,i}^{0})
+    \right)}
+    {\left\|a_i(u;s)-a_i(u';s)\right\|_2+\epsilon},
+    \label{eq:surface_sensitivity}
+\end{equation}
+where \(\cN(u)\) contains feasible small perturbations of timing, speed, target gap, or lateral commitment. High \(\gamma(u)\) indicates that the candidate lies near a response boundary; it is used for repair or conservative rejection, not as an independent notion of coercion.
+
+On a calibration split, we compute an upper calibrated risk \(\rho_{\mathrm{mech}}^{\mathrm{cal}}\). The mechanism-feasible set is
+\begin{equation}
+    \cU_{\mathrm{MF}}(s)
+    =
+    \left\{
+    u\in\cU(s):
+    \rho_{\mathrm{mech}}^{\mathrm{cal}}(u)\le \alpha,\,
+    \nu(u)\le \bar\nu,\,
+    \gamma(u)\le \bar\gamma
+    \right\}.
+    \label{eq:mechanism_feasible_set}
+\end{equation}
+The selected candidate is
+\begin{equation}
+    u^\star
+    =
+    \arg\min_{u\in\cU_{\mathrm{MF}}(s)}
+    J_{\mathrm{nominal}}(u;s),
+    \label{eq:mechanism_feasible_selector}
+\end{equation}
+where \(J_{\mathrm{nominal}}\) contains progress, comfort, route tracking, and traffic-rule preferences. If \(\cU_{\mathrm{MF}}(s)=\varnothing\), the planner first attempts local repair by delaying entry, reducing entry speed, enlarging the target gap, or backing off lateral commitment; if no repaired candidate is feasible, it returns the candidate with the smallest calibrated mechanism risk under a conservative fallback objective.
+
+The total training objective is
+\begin{equation}
+\begin{aligned}
+    \mathcal L
+    &=
+    \mathcal L_{\mathrm{op}}
+    +
+    \lambda_{\mathrm{cw}}\mathcal L_{\mathrm{cw}} \\
+    &=
+    \mathcal L_{\mathrm{mech}}
+    +
+    \lambda_d\mathcal L_{\mathrm{distill}}
+    +
+    \lambda_g\mathcal L_{\mathrm{geo}}
+    +
+    \lambda_{\mathrm{cw}}
+    \left(
+    \mathcal L_{\mathrm{cw\text{-}event}}
+    +
+    \lambda_r\mathcal L_{\mathrm{cw\text{-}rank}}
+    \right).
+\end{aligned}
+\label{eq:total_loss}
+\end{equation}
+No planner-imitation loss is required for the core method: planning is constrained inference over the learned response mechanism rather than a learned additive cost stack.
+
+
+\section{Experiments}
+\label{sec:experiments}
+
+The experiments test one claim: a planner that knows only whether a candidate is risky is insufficient in dense interactions; it must also know whether the candidate's apparent safety is forced through another agent's high-burden ceding. All thresholds and calibration parameters are selected on validation scenes and fixed before test evaluation. Numerical entries are left as \texttt{TBD} placeholders.
+
+\subsection{Datasets, Splits, and Intervention Groups}
+\label{sec:exp_data}
+
+We build same-root intervention groups from WOMD scenes and Waymax rollouts. A root group fixes the observation prefix, map, route context, traffic-control state, relevant agents, simulator reset state, and reactive-policy family; it varies only the ego candidate and, when estimating response distributions, the reactive-policy variant or rollout seed. The main WOMD/Waymax split is used for large-scale evaluation, while a stress split emphasizes dense lane changes, forced merges, target-gap insertions, unprotected turns, ambiguous-priority intersections, and close following. CARLA or a learned sim-agent policy is used only when explicit policy variants are needed to produce controlled ceding and non-ceding responses that IDM cannot provide.
+
+\begin{table}[t]
+\centering
+\caption{Same-root intervention dataset summary. Values are placeholders.}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{lcccccccc}
+\toprule
+Split & Scenes & Root groups & Agents/group & Cand./group & Variants/cand. & Valid rollouts & HP cede & FD positives \\
+\midrule
+Train & TBD & TBD & TBD & TBD & TBD & TBD & TBD & TBD \\
+Validation & TBD & TBD & TBD & TBD & TBD & TBD & TBD & TBD \\
+Test & TBD & TBD & TBD & TBD & TBD & TBD & TBD & TBD \\
+Stress & TBD & TBD & TBD & TBD & TBD & TBD & TBD & TBD \\
+CARLA / policy variants & TBD & TBD & TBD & TBD & TBD & TBD & TBD & TBD \\
+\bottomrule
+\end{tabular}}
+\label{tab:exp_data_summary}
+\end{table}
+
+\subsection{Baselines and Ablations}
+\label{sec:exp_baselines}
+
+All learned methods use the same scene encoder budget, candidate generator, relevant-agent selection, and available supervision masks unless stated otherwise. External baselines are included where implementation is available; otherwise we report faithful in-house variants matched to the same candidate library.
+
+\begin{table}[t]
+\centering
+\caption{Baselines and ablations.}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{lll}
+\toprule
+Name & Reference / source & Purpose of comparison \\
+\midrule
+Rule/IDM & standard rule or IDM planner & Non-learned closed-loop baseline \\
+PiP-EC & PiP \parencite{song2020pip} & Ego-conditioned trajectory prediction without a response surface \\
+DTPP & DTPP \parencite{huang2024dtpp} & Joint ego-conditioned prediction and cost evaluation \\
+PPAD & PPAD \parencite{chen2024ppad} & Iterative prediction--planning interaction \\
+GameFormer & GameFormer \parencite{huang2023gameformer} & Game-theoretic interaction prediction/planning \\
+RACP & RACP \parencite{mustafa2024racp} & Risk-aware contingency planning \\
+HYPE & HYPE \parencite{yu2025hype} & Ego proposal-conditioned occupancy planning \\
+EgoCond-Resp & in-house & Candidate-wise branch/burden/margin heads, no shared operator \\
+Risk+Pressure & in-house & Additive collision-risk and high-pressure penalty \\
+\framework{} w/o Support & ablation & Removes support/query functional supervision \\
+\framework{} w/o Distill & ablation & Removes support-to-scene distillation \\
+\framework{} w/o Geo & ablation & Removes local surface geometry loss \\
+\framework{} w/o FD & ablation & Removes forced-dependence from planning \\
+\framework{} Full & ours & Full mechanism-feasible selector \\
+\bottomrule
+\end{tabular}}
+\label{tab:baselines}
+\end{table}
+
+\subsection{Metrics}
+\label{sec:exp_metrics}
+
+We report only metrics tied to the paper's claims.
+
+\paragraph{Response-surface prediction.}
+Branch negative log-likelihood and accuracy evaluate \(p(M_i\mid u)\). Burden MAE is \(|\Delta b_i-\widehat{\Delta b}_i|\) on valid response observations. High-pressure AUROC uses the label \(z_i^{\mathrm{HP}}=\ind[\Delta b_i\ge \eta_B]\), optionally OR'ed with hard-braking or jerk thresholds defined in Appendix~\ref{app:response_extraction}. minADE/minFDE evaluate branch-conditioned trajectory samples. Risk Brier and ECE evaluate \(\Prob(H_i<0\mid u)\).
+
+\paragraph{Surface geometry and forced dependence.}
+Boundary AUROC uses finite-neighbor labels \(z_i^{\mathrm{bdry}}(u,u')=\ind[M_i(u)\neq M_i(u') \lor z_i^{\mathrm{HP}}(u)\neq z_i^{\mathrm{HP}}(u') \lor \ind[H_i(u)<0]\neq \ind[H_i(u')<0]]\). Burden Kendall \(\tau\) measures whether predicted burden ranks agree with rollout burden across same-root candidates. Forced-dependence AUROC/ECE evaluate \(\kappa_i(u)\) against probe-derived soft or hard labels. False-safe rate is the fraction of selected candidates whose realized or probe-derived label satisfies high ceding safety and non-ceding unsafety:
+\[
+\mathrm{FSR}
+=
+\frac{1}{N}
+\sum_{n=1}^{N}
+\ind\!\left[
+S^{\cC}(u_n)>\eta_{\mathrm{safe}},
+\;
+S^{\bar{\cC}}(u_n)<\eta_{\mathrm{unsafe}},
+\;
+B^{\cC}(u_n)>\eta_B
+\right].
+\]
+
+\paragraph{Closed-loop planning.}
+Success, collision, off-route, progress, and comfort follow simulator metrics. Induced hard braking is the mean or rate of non-ego agents with \(\max_t(-a_i(t))>a_{\mathrm{hard}}\). Unsafe-gap insertion is the rate at which ego enters a conflict region with time gap below \(\eta_g\) and the rear/priority agent subsequently brakes above \(a_{\mathrm{hard}}\). FD rate is the mean selected-candidate \(\max_i\kappa_i(u^\star)\) or the rate above a fixed threshold. Boundary violation is the rate of selected candidates with \(\gamma(u^\star)>\bar\gamma\). Tail risk is reported as \(\mathrm{CVaR}_{q}\) of per-scene mechanism violation, collision, or false-safe loss.
+
+\subsection{Experiment 1: Same-Root Held-Out Response Prediction}
+\label{sec:exp_heldout_response}
+
+This experiment asks whether the model learns a function over interventions rather than a candidate-wise labeler. For each root group, interventions are split into support and query sets; all rollout variants of a query intervention are withheld. Models predict held-out query responses from the scene-only token and, for diagnostic training-time evaluation, from support-adapted tokens. The critical comparison is \textbf{EgoCond-Resp} versus \textbf{\framework{} Full}: both can predict branch, burden, motion, and margin, but only \framework{} is trained to represent a same-root surface.
+
+\begin{table}[t]
+\centering
+\caption{Held-out intervention response prediction. Values are placeholders.}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{lccccccc}
+\toprule
+Model & Branch NLL $\downarrow$ & Branch Acc. $\uparrow$ & Burden MAE $\downarrow$ & HP AUROC $\uparrow$ & minADE $\downarrow$ & Risk Brier $\downarrow$ & ECE $\downarrow$ \\
+\midrule
+PiP-EC & TBD & TBD & TBD & TBD & TBD & TBD & TBD \\
+DTPP & TBD & TBD & TBD & TBD & TBD & TBD & TBD \\
+EgoCond-Resp & TBD & TBD & TBD & TBD & TBD & TBD & TBD \\
+\framework{} w/o Support & TBD & TBD & TBD & TBD & TBD & TBD & TBD \\
+\framework{} w/o Distill & TBD & TBD & TBD & TBD & TBD & TBD & TBD \\
+\framework{} w/o Geo & TBD & TBD & TBD & TBD & TBD & TBD & TBD \\
+\framework{} Full & TBD & TBD & TBD & TBD & TBD & TBD & TBD \\
+\bottomrule
+\end{tabular}}
+\label{tab:heldout_response}
+\end{table}
+
+\subsection{Experiment 2: Surface Geometry and Coercion Attribution}
+\label{sec:exp_surface_geometry}
+
+This experiment tests whether local surface changes correspond to actual response transitions, and whether \(\kappa_i\) separates comfortable cooperation from coercive yielding. We evaluate local neighbor pairs around each candidate, then evaluate forced-dependence labels on policy-variant rollouts. The main failure mode to expose is a pressure-only planner: it should either miss false-safe candidates when the pressure weight is low, or reject ordinary cooperative ceding when the pressure weight is high.
+
+\begin{table}[t]
+\centering
+\caption{Surface geometry and forced-dependence diagnostics. Values are placeholders.}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{lcccccc}
+\toprule
+Model & Boundary AUROC $\uparrow$ & Burden Kendall $\uparrow$ & HP AUROC $\uparrow$ & FD AUROC $\uparrow$ & FD ECE $\downarrow$ & Comfortable-cede reject $\downarrow$ \\
+\midrule
+TTC/DRAC heuristic & TBD & TBD & TBD & TBD & TBD & TBD \\
+EgoCond-Resp & TBD & TBD & TBD & TBD & TBD & TBD \\
+Risk+Pressure & TBD & TBD & TBD & TBD & TBD & TBD \\
+\framework{} w/o Geo & TBD & TBD & TBD & TBD & TBD & TBD \\
+\framework{} w/o FD & TBD & TBD & TBD & TBD & TBD & TBD \\
+\framework{} Full & TBD & TBD & TBD & TBD & TBD & TBD \\
+\bottomrule
+\end{tabular}}
+\label{tab:surface_geometry_fd}
+\end{table}
+
+\subsection{Experiment 3: Coercive False-Safe Offline Selection}
+\label{sec:exp_false_safe}
+
+This benchmark contains candidate sets where at least one candidate is collision-free only under high-pressure ceding, one candidate is collision-free with low-pressure cooperation or self-preserved margin, and one candidate is unsafe under non-ceding. The selector observes only pre-execution scene information and model predictions; rollout outcomes are used only for evaluation. This experiment isolates the planner's selection logic from closed-loop compounding errors.
+
+\begin{table}[t]
+\centering
+\caption{Coercive false-safe offline selection. Values are placeholders.}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{lcccccccc}
+\toprule
+Selector & False-safe $\downarrow$ & FD rate $\downarrow$ & Hard brake $\downarrow$ & Coll. $\downarrow$ & Near coll. $\downarrow$ & Progress $\uparrow$ & Comfort $\uparrow$ & Oracle regret $\downarrow$ \\
+\midrule
+Task cost only & TBD & TBD & TBD & TBD & TBD & TBD & TBD & TBD \\
+EgoCond risk & TBD & TBD & TBD & TBD & TBD & TBD & TBD & TBD \\
+Risk+Pressure & TBD & TBD & TBD & TBD & TBD & TBD & TBD & TBD \\
+RACP-style risk & TBD & TBD & TBD & TBD & TBD & TBD & TBD & TBD \\
+\framework{} w/o FD & TBD & TBD & TBD & TBD & TBD & TBD & TBD & TBD \\
+\framework{} w/o Boundary & TBD & TBD & TBD & TBD & TBD & TBD & TBD & TBD \\
+\framework{} Full & TBD & TBD & TBD & TBD & TBD & TBD & TBD & TBD \\
+\bottomrule
+\end{tabular}}
+\label{tab:false_safe_selection}
+\end{table}
+
+\subsection{Experiment 4: Closed-Loop Non-Coercive Planning}
+\label{sec:exp_closed_loop}
+
+Closed-loop evaluation is the primary planning test. At every step, the planner generates candidates, queries scene-only response operators for relevant agents, computes calibrated mechanism risk, forced dependence, uncertainty, and surface sensitivity, optionally repairs boundary-sensitive candidates, and executes the selected action. We evaluate performance on default Waymax reactive agents and on stress/policy-shift settings. The key criterion is not maximum progress alone, but progress at low collision, low induced burden, and low forced-dependence.
+
+\begin{table}[t]
+\centering
+\caption{Closed-loop planning on interactive scenes. Values are placeholders.}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{lccccccccc}
+\toprule
+Planner & Success $\uparrow$ & Coll. $\downarrow$ & Off-route $\downarrow$ & Progress $\uparrow$ & Comfort $\uparrow$ & Hard brake $\downarrow$ & FD rate $\downarrow$ & Boundary viol. $\downarrow$ & CVaR $\downarrow$ \\
+\midrule
+Rule/IDM & TBD & TBD & TBD & TBD & TBD & TBD & TBD & TBD & TBD \\
+DTPP & TBD & TBD & TBD & TBD & TBD & TBD & TBD & TBD & TBD \\
+GameFormer & TBD & TBD & TBD & TBD & TBD & TBD & TBD & TBD & TBD \\
+RACP & TBD & TBD & TBD & TBD & TBD & TBD & TBD & TBD & TBD \\
+HYPE & TBD & TBD & TBD & TBD & TBD & TBD & TBD & TBD & TBD \\
+Risk+Pressure & TBD & TBD & TBD & TBD & TBD & TBD & TBD & TBD & TBD \\
+\framework{} w/o FD & TBD & TBD & TBD & TBD & TBD & TBD & TBD & TBD & TBD \\
+\framework{} Full & TBD & TBD & TBD & TBD & TBD & TBD & TBD & TBD & TBD \\
+\bottomrule
+\end{tabular}}
+\label{tab:closed_loop}
+\end{table}
+
+\subsection{Experiment 5: Robustness and Ablation Stress Tests}
+\label{sec:exp_robustness}
+
+Robustness is measured under simulator-policy shifts, aggressive and conservative agents, mixed agent populations, reduced candidate density, response-model miscalibration, and scenario-stress shifts. The purpose is to check whether the response surface is merely fitting the default simulator or whether it remains useful when the same candidate induces different levels of ceding pressure.
+
+\begin{table}[t]
+\centering
+\caption{Robustness under simulator-policy and stress-condition shifts. Values are placeholders.}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{lccccc}
+\toprule
+Setting & Response NLL $\downarrow$ & FD AUROC $\uparrow$ & Offline false-safe $\downarrow$ & Closed-loop success $\uparrow$ & Closed-loop FD $\downarrow$ \\
+\midrule
+Default reactive policy & TBD & TBD & TBD & TBD & TBD \\
+Aggressive agents & TBD & TBD & TBD & TBD & TBD \\
+Conservative agents & TBD & TBD & TBD & TBD & TBD \\
+Mixed agents & TBD & TBD & TBD & TBD & TBD \\
+Low candidate density & TBD & TBD & TBD & TBD & TBD \\
+Stress split & TBD & TBD & TBD & TBD & TBD \\
+\bottomrule
+\end{tabular}}
+\label{tab:robustness}
+\end{table}
+
+\subsection{Qualitative Surface Slices}
+\label{sec:exp_qualitative}
+
+For representative lane changes, merges, and unprotected turns, we visualize one- and two-dimensional surface slices over timing delay, target gap, speed multiplier, lateral commitment, or conflict-region buffer. Each plot shows cede probability, high-pressure probability, \(S^{\cC}\), \(S^{\bar{\cC}}\), forced dependence \(\kappa\), boundary sensitivity \(\gamma\), and the selected candidate. These figures are used to verify the intended interpretation: early low-pressure ceding should be accepted, late high-pressure ceding should be rejected when non-ceding is unsafe, and response-boundary candidates should trigger repair or conservative fallback.
+
+
+\section{Conclusion}
+
+We presented \framework{}, a same-root intervention-response surface framework for non-coercive autonomous driving. The central idea is that a planner should not only estimate whether an ego candidate is collision-free, but also attribute whether its safety is robust without forcing another road user into high-pressure ceding. \framework{} learns a queryable response mechanism over ego interventions, trains it with support/query same-root probes, derives branch-conditioned forced-dependence evidence, and selects actions from a calibrated mechanism-feasible set. This shifts interactive planning from candidate-wise outcome scoring toward response-mechanism-level safety attribution.
+
+
+\appendix
+
+\section{Reproducible Construction of Scene-Conditioned Intervention Probes}
+\label{app:probe_construction}
+
+This appendix specifies one implementable construction of Eq.~\eqref{eq:probe_set} using WOMD and Waymax. The method does not depend on this exact simulator; it only requires same-root counterfactual rollouts in which the root scene is fixed and the ego intervention changes.
+
+\subsection{Dataset and simulator state}
+\label{app:womd_waymax_state}
+
+WOMD provides \(10\,\mathrm{Hz}\) object tracks and map data. For motion prediction, each example contains \(1\,\mathrm{s}\) of history, the current state, and \(8\,\mathrm{s}\) of future. We load scenes in Waymax, which supports log playback, IDM-based route following, state-based control, kinematic bicycle control, simulator metrics, and user-provided sim agents \parencite{ettinger2021large,gulino2023waymax}.
+
+For each scenario, \(t_0\) is the current time after the history window. We construct
+\[
+s=\left(\cG,\cL,\{x_j(t)\}_{j\in\cA\cup\{e\},\,t\le t_0},r_e\right),
+\]
+where \(\cG\) is the vector road graph, \(\cL\) contains traffic-light and static-control states, \(e\) is the ego/SDC, \(r_e\) is the ego route context when available, and \(x_j(t)\) contains position, heading, velocity, size, type, and validity masks. All dynamic states are transformed into the ego-centered frame at \(t_0\). We retain agents that satisfy at least one criterion: within radius \(R\) of any ego candidate corridor, predicted or logged path intersects the ego route corridor, directly leads/follows the ego lane interval, is lane-adjacent to a target gap, or appears in the WOMD objects-to-predict or interacting-object set.
+
+\subsection{Conflict region extraction}
+\label{app:conflict_region}
+
+For each retained agent \(i\), we construct an interaction region \(\cZ_i\). Let \(\Gamma_e^k\) be the centerline or swept path of ego candidate \(u^k\), and let \(\Gamma_i^{\mathrm{ref}}\) be the agent's reference path. For Waymax IDM this reference path is the logged route followed by the IDM agent; for learned sim agents it is the most likely short-horizon route or logged path used only for defining the interaction coordinate. We compute \(\cZ_i^k\) as the intersection of swept oriented boxes along \(\Gamma_e^k\) and \(\Gamma_i^{\mathrm{ref}}\), dilated by half the sum of ego and agent widths plus a safety slack. If no geometric intersection exists but the pair is leading/following or lane-adjacent, \(\cZ_i^k\) is the closest longitudinal interval on the lane graph.
+
+Entry and exit times are computed on the discrete \(10\,\mathrm{Hz}\) grid with linear interpolation between adjacent samples:
+\[
+\tau_{e,i}^{\mathrm{in}}(u^k)
+=
+\inf\{t:\operatorname{box}_e^k(t)\cap\cZ_i^k\neq\varnothing\},
+\qquad
+\tau_{e,i}^{\mathrm{out}}(u^k)
+=
+\sup\{t:\operatorname{box}_e^k(t)\cap\cZ_i^k\neq\varnothing\}.
+\]
+Analogous times \(\tau_{i,k}^{\mathrm{in}}\) and \(\tau_{i,k}^{\mathrm{out}}\) are computed from the realized agent trajectory. If an actor never enters the region within the horizon, the corresponding time is marked censored and set to \(T+\Delta_{\mathrm{cens}}\) only for ordered comparisons; loss terms using the exact time are masked.
+
+\subsection{Ego intervention library}
+\label{app:ego_library}
+
+For each root scene, we generate \(\cU(s)=\{u^k\}_{k=1}^{K}\) from three sources:
+\begin{enumerate}[leftmargin=*]
+    \item \textbf{Logged anchor.} The logged SDC future is included when valid. It anchors the library but is not assumed to be optimal or non-coercive.
+    \item \textbf{Route-consistent spatial paths.} We use WOMD/Waymax route information when available; otherwise we enumerate lane-graph paths from the ego's current lane and retain paths compatible with the logged heading and legal topology.
+    \item \textbf{Timing and assertiveness perturbations.} For each spatial path, we sample target speed, acceleration, time-to-conflict-region, gap choice, and lateral commitment. Profiles include yielding, neutral, conservative, and assertive variants.
+\end{enumerate}
+Each candidate is converted either to a state sequence for Waymax state-based control or to acceleration/steering controls for the kinematic bicycle model. The same execution mode is used within one experiment. Candidates with severe kinematic infeasibility, off-route behavior, or invalid map occupancy are discarded or marked as invalid before response labeling.
+
+\subsection{Scene-fixed rollout protocol}
+\label{app:rollout_protocol}
+
+For each ego candidate \(u^k\), we reset the simulator to the same state at \(t_0\) and roll out for \(T=8\,\mathrm{s}\). The ego is controlled by \(u^k\). Surrounding agents are controlled by a reactive policy variant \(\pi^r\). We store
+\[
+\left(
+s,\,
+u^k,\,
+\pi^r,\,
+\{x_j^{k,r}(t)\}_{j\in\cA\cup\{e\},\,t=t_0+1:t_0+T}
+\right)
+\]
+with validity masks, simulator metrics, and the deterministic seed or policy-variant identifier.
+
+The default reproducible setting is Waymax IDM for vehicles and log playback for non-reactive diagnostic ablations. Log playback is not used as the primary response supervisor because it ignores the counterfactual ego intervention. A single deterministic IDM policy is also insufficient for branch-conditioned ceding/non-ceding safety; therefore forced-dependence labels require either multiple IDM parameterizations, learned sim-agent variants, CARLA stress policies, or explicit policy perturbations. If only one reactive rollout is available for a candidate, the response likelihood can still be trained, but forced-dependence labels for that candidate receive low confidence \(w_i(u^k)\).
+
+\subsection{Response primitive extraction}
+\label{app:response_extraction}
+
+For each scene--agent--candidate--variant tuple \((s,i,u^k,\pi^r)\), we extract \(o_i^{k,r}=(m_i^{k,r},y_i^{k,r},\Delta b_i^{k,r},h_i^{k,r})\).
+
+\paragraph{Trajectory.}
+The trajectory target is
+\[
+y_i^{k,r}=\{x_i^{k,r}(t)\}_{t=t_0+1}^{t_0+T},
+\]
+represented in the ego-centered frame at \(t_0\). Invalid timesteps are masked.
+
+\paragraph{Response branch.}
+Branches are
+\[
+m_i^{k,r}\in
+\{\mathrm{keep},\mathrm{cede},\mathrm{brake},\mathrm{accelerate},\mathrm{pass},\mathrm{nonconflict}\}.
+\]
+We compute evidence scores rather than relying on one brittle rule:
+\[
+\begin{aligned}
+e_{\mathrm{cede}} &= \ind[\tau_{e,i}^{\mathrm{in}}<\tau_{i,k}^{\mathrm{in}}]\,
+\left[\tau_{i,k}^{\mathrm{in}}-\tau_{i,0}^{\mathrm{in}}\right]_+,\\
+e_{\mathrm{brake}} &= \left[\max_t(-a_i^{k,r}(t))-a_{\mathrm{brake}}\right]_+,\\
+e_{\mathrm{accel}} &= \left[\max_t a_i^{k,r}(t)-a_{\mathrm{accel}}\right]_+\,
+\ind[\tau_{i,k}^{\mathrm{in}}<\tau_{e,i}^{\mathrm{in}}],\\
+e_{\mathrm{pass}} &= \ind[\tau_{i,k}^{\mathrm{out}}<\tau_{e,i}^{\mathrm{in}}-\Delta t_{\mathrm{pass}}],\\
+e_{\mathrm{keep}} &= \exp\!\left(-\frac{|\tau_{i,k}^{\mathrm{in}}-\tau_{i,0}^{\mathrm{in}}|}{\sigma_\tau}
+-\frac{\operatorname{ADE}(y_i^{k,r},y_i^{0,r})}{\sigma_y}\right).
+\end{aligned}
+\]
+The non-conflict branch is assigned when neither actor enters \(\cZ_i^k\) within the horizon or the minimum predicted interaction gap is above a scenario-specific threshold. Soft labels are obtained by normalizing these evidence scores. Hard labels for accuracy are the maximum-evidence branch after applying the non-conflict mask. For coercion, \(\cC_i=\{\mathrm{cede},\mathrm{brake}\}\) by default; \(\mathrm{pass}\) and \(\mathrm{accelerate}\) are non-ceding unless local traffic rules define otherwise.
+
+\paragraph{Neutral baseline.}
+The neutral candidate \(u^0\) is chosen within the same root scene as follows: logged SDC if valid and non-aggressive by entry-gap and acceleration checks; otherwise the lowest-acceleration route-consistent candidate that maintains or increases the neutral time gap; otherwise the candidate with minimum predicted mechanism risk under log-playback diagnostics. All baseline quantities use the same reactive-policy variant when possible. If the neutral baseline is invalid for an agent, burden terms depending on it are masked and the candidate receives lower witness confidence.
+
+\paragraph{Baseline-relative burden.}
+With robust training-set scales \(s_{\mathrm{delay}},s_{\mathrm{dec}},s_{\mathrm{jerk}},s_{\mathrm{dev}}\), burden is
+\begin{equation}
+\begin{aligned}
+    \Delta b_i^{k,r}
+    &=
+    c_{\mathrm{delay}}
+    \frac{\left[
+    \tilde\tau_{i,k}^{\mathrm{in}}-\tilde\tau_{i,0}^{\mathrm{in}}
+    \right]_+}{s_{\mathrm{delay}}}
+    +
+    c_{\mathrm{dec}}
+    \frac{\left[
+    \max_t(-a_i^{k,r}(t))-\max_t(-a_i^{0,r}(t))
+    \right]_+}{s_{\mathrm{dec}}} \\
+    &\quad+
+    c_{\mathrm{jerk}}
+    \frac{\left[
+    \operatorname{RMS}_t(j_i^{k,r}(t))-\operatorname{RMS}_t(j_i^{0,r}(t))
+    \right]_+}{s_{\mathrm{jerk}}}
+    +
+    c_{\mathrm{dev}}
+    \frac{\operatorname{ADE}(y_i^{k,r},y_i^{0,r})}{s_{\mathrm{dev}}},
+\end{aligned}
+\label{eq:appendix_burden}
+\end{equation}
+where \(\tilde\tau\) uses the censored value \(T+\Delta_{\mathrm{cens}}\) only for ordering. The high-pressure label is
+\[
+z_i^{\mathrm{HP}}(u^k,r)
+=
+\ind\!\left[
+\Delta b_i^{k,r}\ge\eta_B
+\;\lor\;
+\max_t(-a_i^{k,r}(t))\ge a_{\mathrm{hard}}
+\;\lor\;
+\operatorname{RMS}_t(j_i^{k,r}(t))\ge j_{\mathrm{hard}}
+\right].
+\]
+Thresholds are selected on validation scenes and fixed for test evaluation.
+
+\paragraph{Safety margin.}
+The default safety margin is the minimum signed oriented-box separation:
+\begin{equation}
+    h_i^{k,r}
+    =
+    \min_{t\in[t_0,t_0+T]}
+    d_{\mathrm{signed}}
+    \left(
+    \operatorname{box}_e^k(t),
+    \operatorname{box}_i^{k,r}(t)
+    \right).
+    \label{eq:appendix_margin}
+\end{equation}
+The distance is positive for disjoint boxes and negative for penetration depth. Near-collision labels use \(h_i^{k,r}<d_{\mathrm{near}}\). A temporal metric such as TTC may be concatenated with \(H_i\), but the same definition must be used for training, calibration, and evaluation.
+
+\subsection{Priority score}
+\label{app:priority_score}
+
+The priority score \(p_i^{\mathrm{prio}}(u)\in[0,1]\) is a calibrated rule or small classifier using only pre-execution information:
+\[
+p_i^{\mathrm{prio}}(u)
+=
+\sigma\!\left(w^\top\phi_i^{\mathrm{prio}}(s,u)\right).
+\]
+The feature vector \(\phi_i^{\mathrm{prio}}\) includes ego/agent protected-lane indicators, ego/agent traffic-control right-of-way, neutral entry-time ordering \(\tau_{e,i}^{\mathrm{in}}(u)-\tau_{i,0}^{\mathrm{in}}\), route alignment, and yield/stop-sign evidence. When traffic-control or route information is missing, the score is set to an uncertain prior and the witness confidence is reduced. This prevents missing priority metadata from being interpreted as evidence of coercion.
+
+\subsection{Support/query split}
+\label{app:support_query_split}
+
+Splits are by ego intervention, not by timestep and not by rollout variant. If candidate \(u^q\) is in the query set, all of its variants \(\{o_i^{q,r}\}_{r}\) are withheld from the support encoder. The support set is stratified to include conservative, neutral, and assertive candidates. The query set includes near-neighbor perturbations and larger changes in conflict-entry time, target gap, and speed. This split is necessary for \(\mathcal L_{\mathrm{geo}}\) and for testing whether the surface generalizes across interventions.
+
+\section{Implementation of the Mechanism Token Operator}
+\label{app:network_training}
+
+\subsection{Scene and probe encoders}
+
+Map polylines, lane boundaries, route paths, crosswalks, and traffic controls are encoded as vector tokens. Agent histories are encoded by temporal attention over valid states. The target agent \(i\) receives a learned role token. The probe encoder embeds \((a_i(u^k;s),e_O(o_i^{k,r}))\), where \(e_O\) contains branch-label probabilities, trajectory features, burden, margin, high-pressure label, and validity masks. A Set Transformer or attention pooling layer preserves permutation invariance \parencite{lee2019set}. The mechanism token bank uses \(L=8\) or \(16\) slots by default; the same decoder is shared by \(\Omega_{s,i}^{\cS}\) and \(\Omega_{s,i}^{0}\).
+
+\subsection{Likelihood terms inside \texorpdfstring{\(\mathcal L_{\mathrm{mech}}\)}{Lmech}}
+
+The compact likelihood in Eq.~\eqref{eq:mechanism_likelihood} is implemented as
+\begin{equation}
+\begin{aligned}
+    -\log p_\theta(o_i^q\mid u^q,s,\Omega)
+    &=
+    \mathrm{CE}(m_i^q,\hat p_M)
+    +
+    \lambda_Y\,\mathcal N_{\mathrm{traj}}(y_i^q;\hat p_Y)
+    +
+    \lambda_B\,\mathcal N_{\mathrm{burden}}(\Delta b_i^q;\hat p_B)\\
+    &\quad+
+    \lambda_H\,\mathcal N_{\mathrm{margin}}(h_i^q;\hat p_H).
+\end{aligned}
+\label{eq:appendix_likelihood}
+\end{equation}
+\(\mathcal N_{\mathrm{traj}}\) can be a Gaussian-mixture NLL or a masked ADE/FDE surrogate; \(\mathcal N_{\mathrm{burden}}\) and \(\mathcal N_{\mathrm{margin}}\) can be Gaussian, quantile, or discretized-logistic likelihoods. These are implementation choices for one operator likelihood, not separate conceptual objectives.
+
+\subsection{Geometry loss instantiation}
+
+For a pair of interventions \((u^a,u^b)\),
+\begin{equation}
+\begin{aligned}
+    d_O(o_i^a,o_i^b)
+    &=
+    \beta_M\,\operatorname{TV}(m_i^a,m_i^b)
+    +
+    \beta_Y\,\frac{\operatorname{ADE}(y_i^a,y_i^b)}{s_Y}
+    +
+    \beta_B\,\frac{|\Delta b_i^a-\Delta b_i^b|}{s_B}
+    +
+    \beta_H\,\frac{|h_i^a-h_i^b|}{s_H},
+\end{aligned}
+\label{eq:appendix_response_metric}
+\end{equation}
+where \(\operatorname{TV}\) is total variation for soft branch labels and \(s_Y,s_B,s_H\) are robust training-set scales. \(D_p\) in Eq.~\eqref{eq:geometry_loss} is the symmetrized KL divergence between branch distributions plus a trajectory-distribution distance such as 2-Wasserstein for Gaussian components. We sample both local pairs with small \(\|a_i(u^a;s)-a_i(u^b;s)\|\) and global pairs with different conflict-entry orderings.
+
+\section{Coercion Witness Supervision}
+\label{app:cw_supervision}
+
+Forced-dependence supervision requires evidence under both ceding and non-ceding responses. For candidate \(u^k\), with rollout variants \(r\), define
+\begin{align}
+    \widehat S_i^{\cC}(u^k)
+    &=
+    \frac{\sum_r w_r\,\ind[m_i^{k,r}\in\cC_i]\,\ind[h_i^{k,r}>0]}
+    {\sum_r w_r\,\ind[m_i^{k,r}\in\cC_i]+\epsilon},\\
+    \widehat S_i^{\bar{\cC}}(u^k)
+    &=
+    \frac{\sum_r w_r\,\ind[m_i^{k,r}\notin\cC_i]\,\ind[h_i^{k,r}>0]}
+    {\sum_r w_r\,\ind[m_i^{k,r}\notin\cC_i]+\epsilon},\\
+    \widehat B_i^{\cC}(u^k)
+    &=
+    \frac{\sum_r w_r\,\ind[m_i^{k,r}\in\cC_i]\,\Delta b_i^{k,r}}
+    {\sum_r w_r\,\ind[m_i^{k,r}\in\cC_i]+\epsilon}.
+\end{align}
+When there are too few variants on either side, the label is kept soft but its confidence is reduced. The soft target is
+\begin{equation}
+    \tilde z_i(u^k)
+    =
+    \sigma
+    \left(
+    \frac{\widehat S_i^{\cC}(u^k)-\widehat S_i^{\bar{\cC}}(u^k)-\eta_H}{\tau_H}
+    \right)
+    \sigma
+    \left(
+    \frac{\widehat B_i^{\cC}(u^k)-\eta_B}{\tau_B}
+    \right)
+    \left(
+    1-\widehat p_i^{\mathrm{prio}}(u^k)
+    \right).
+    \label{eq:appendix_soft_cw_label}
+\end{equation}
+The confidence \(w_i(u^k)\) in Eq.~\eqref{eq:cw_event_loss} is proportional to the number, validity, and diversity of ceding and non-ceding variants near \(u^k\). Ranking pairs are included when
+\[
+    \widehat D_i^{\cC}(u^+)-\widehat D_i^{\cC}(u^-)> \epsilon_D
+    \quad\text{and}\quad
+    \widehat B_i^{\cC}(u^+)-\widehat B_i^{\cC}(u^-)> \epsilon_B,
+\]
+and are excluded when priority evidence is ambiguous or either candidate lacks valid observations.
+
+\section{Mechanism-Feasible Selector and Calibration}
+\label{app:selector_calibration}
+
+For each scene, the selector evaluates \(\Omega_{s,i}^{0}\) for all relevant agents and candidates. The per-agent violation probability is
+\begin{equation}
+    \hat p_i^{\mathrm{viol}}(u)
+    =
+    p_i^{\mathrm{unsafe}}(u)
+    +
+    \kappa_i(u)
+    -
+    p_i^{\mathrm{unsafe}}(u)\,\kappa_i(u),
+    \qquad
+    p_i^{\mathrm{unsafe}}(u)=
+    \Prob_\theta(H_i(u)<0\mid s,u,\Omega_{s,i}^{0}).
+    \label{eq:appendix_agent_violation}
+\end{equation}
+The scene-level mechanism risk is approximated as
+\begin{equation}
+    \hat\rho_{\mathrm{mech}}(u)
+    =
+    1-
+    \prod_{i\in\cA(s)}
+    \left(
+    1-\hat p_i^{\mathrm{viol}}(u)
+    \right),
+    \label{eq:appendix_scene_violation}
+\end{equation}
+or estimated by Monte Carlo sampling if correlated agent responses are modeled.
+
+For split calibration, let \(V_j(u)\in\{0,1\}\) be the observed mechanism violation for candidate \(u\) in calibration scene \(j\), and let \(r_j(u)=V_j(u)-\hat\rho_{\mathrm{mech}}(u)\). We compute
+\begin{equation}
+    q_\beta
+    =
+    \operatorname{Quantile}_{1-\beta}
+    \left(
+    \{r_j(u): j\in\cD_{\mathrm{cal}},\,u\in\cU(s_j)\}
+    \right)
+    \label{eq:appendix_cal_quantile}
+\end{equation}
+and set
+\begin{equation}
+    \rho_{\mathrm{mech}}^{\mathrm{cal}}(u)
+    =
+    \min\{1,\hat\rho_{\mathrm{mech}}(u)+q_\beta\}.
+    \label{eq:appendix_cal_risk}
+\end{equation}
+This is a simple conservative upper calibration layer. If formal risk control is desired, \(\alpha\) can instead be selected on a calibration split to control the expected violation loss of the selector using conformal risk control or conformal planning methods \parencite{angelopoulos2024conformal,lindemann2023safe,dixit2023adaptive}. The calibration layer is not part of the definition of coercion; it only makes filtering conservative.
+
+\section{Implementation Checks and Failure Modes}
+\label{app:implementation_checks}
+
+The following checks are required for code-level reproducibility:
+\begin{enumerate}[leftmargin=*]
+    \item \textbf{Same-root reset.} All candidates in a group must reset from identical simulator states at \(t_0\). Otherwise branch and burden differences can reflect different initial conditions rather than ego interventions.
+    \item \textbf{No log-playback labels for reaction.} Log playback may be used for debugging and route extraction, but not for response-mechanism supervision, because it does not react to counterfactual ego motion.
+    \item \textbf{Multiple variants for forced dependence.} A single deterministic rollout cannot identify \(S^{\cC}\) and \(S^{\bar{\cC}}\). Such samples may train prediction heads but should receive low witness confidence.
+    \item \textbf{Censoring masks.} Entry-time, delay, and branch labels must handle actors that never enter the conflict region within the horizon.
+    \item \textbf{Priority uncertainty.} Missing traffic-control or route metadata should reduce confidence rather than defaulting to low priority.
+    \item \textbf{Deployment separation.} Support-adapted tokens are diagnostic/training objects. All reported planning numbers must use scene-only tokens \(\Omega^0\).
+\end{enumerate}
+
+\section{Recommended Ablations}
+\label{app:ablations}
+
+The following ablations test the conceptual components without changing the planner interface:
+\begin{enumerate}[leftmargin=*]
+    \item \textbf{Candidate-wise predictor:} replace \(\Omega_{s,i}\) with \(f_\theta(s,i,u)\) and remove support/query mechanism inference.
+    \item \textbf{No geometry loss:} remove \(\mathcal L_{\mathrm{geo}}\).
+    \item \textbf{No scene-only distillation:} train only \(\Omega^{\cS}\) and evaluate \(\Omega^{0}\).
+    \item \textbf{No policy variants:} train with one deterministic rollout per candidate and downweight witness labels.
+    \item \textbf{Risk-only planning:} remove \(Z_i^{\mathrm{coer}}\) from Eq.~\eqref{eq:mechanism_violation_event}.
+    \item \textbf{Additive-cost planner:} replace Eq.~\eqref{eq:mechanism_feasible_selector} with a weighted sum of nominal, collision, burden, and coercion costs.
+    \item \textbf{No boundary filter:} remove \(\gamma(u)\) from Eq.~\eqref{eq:mechanism_feasible_set}.
+\end{enumerate}
+
+\printbibliography
+\end{document}
