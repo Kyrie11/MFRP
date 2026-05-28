@@ -1,0 +1,4 @@
+defaults:
+  - ../model/scope_full.yaml
+planning:
+  use_forced_dependence: false

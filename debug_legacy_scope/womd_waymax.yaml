@@ -1,0 +1,71 @@
+seed: 13
+output:
+  dataset_dir: outputs/datasets/scope_womd_waymax
+data:
+  split: train
+  source: womd
+  womd_version: "1.3.1"
+  data_path: "/data0/senzeyu2/dataset/WOMD/waymo_open_dataset_motion_v_1_3_1/uncompressed/tf_example/training/training_tfexample.tfrecord@1000"
+  max_num_objects: 128
+  max_num_rg_points: 30000
+  history_horizon_s: 2.0
+  future_horizon_s: 8.0
+  dt: 0.1
+  include_sdc_paths: true
+  allow_synthetic: false
+  synthetic_count: 8
+  relevant_agents: 12
+  neighbor_count: 8
+  # Keep only roots dense enough for same-root support/query surface learning.
+  # Lower this to 1 for raw dataset debugging.
+  min_candidates_per_scene: 8
+  agent_types: [vehicle]
+  num_paths: 45
+  num_points_per_path: 800
+candidates:
+  candidate_count: 32
+  timing_shifts_s: [-1.0, -0.5, 0.0, 0.5, 1.0, 1.5]
+  speed_multipliers: [0.75, 0.9, 1.0, 1.1]
+  # Explicit non-coercive alternatives for candidate-B style evidence:
+  # preserve margin by slowing/yielding rather than relying on another agent.
+  courtesy_speed_multipliers: [0.45, 0.60]
+  courtesy_buffers_m: [12.0, 18.0]
+  lateral_durations_s: [2.0, 3.0, 4.0, 5.0]
+  lateral_midpoint_shifts_s: [-0.5, 0.0, 0.5]
+  lane_commit_lateral_offsets_m: [1.5, 2.5, 3.5]
+  sdc_path_proposals: 8
+  planner_proposals: 8
+  max_repair_candidates: 8
+  # WOMD logged/SDC-path trajectories can have noisy finite-difference jerk.
+  # These thresholds are only for candidate retention; Waymax rollout metrics still
+  # audit overlap/offroad/wrong-way/kinematic validity after simulation.
+  feasibility_max_accel: 4.0
+  feasibility_max_jerk: 12.0
+  feasibility_max_lateral_accel: 4.0
+  feasibility_drivable_tolerance_m: 5.0
+  feasibility_route_tolerance_m: 12.0
+rollout:
+  backend: waymax_state_control
+  fallback_to_reactive: false
+  policy_family_id: idm_default
+  multi_policy: true
+  write_policy_variant_groups: false
+  policy_family:
+    neutral_idm:
+      desired_time_headway: 1.5
+      min_gap: 2.0
+      max_accel: 2.0
+      comfortable_decel: 2.0
+      yield_bias: 0.0
+    conservative_idm:
+      desired_time_headway: 2.0
+      min_gap: 4.0
+      max_accel: 1.5
+      comfortable_decel: 1.5
+      yield_bias: 0.6
+    assertive_idm:
+      desired_time_headway: 1.0
+      min_gap: 1.0
+      max_accel: 2.5
+      comfortable_decel: 3.0
+      yield_bias: -0.5

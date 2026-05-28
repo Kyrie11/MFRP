@@ -1,0 +1,54 @@
+seed: 17
+data:
+  split: train
+  dt: 0.1
+  future_horizon_s: 8.0
+model:
+  name: scope
+  use_structured_intervention: true
+  use_contextual_residual: true
+  use_operator_tokens: true
+  use_support_query: true
+  use_scene_only_loss: true
+  use_support_adapted_loss: true
+  use_distillation: true
+  use_manifold_loss: true
+  branch_head: true
+  burden_head: ordinal
+  trajectory_head: mixture
+  safety_head: true
+  intervention_dim: 128
+  mechanism_tokens: 16
+  hidden_dim: 256
+  trajectory_modes: 6
+  support_updater_blocks: 3
+  dropout: 0.1
+planning:
+  use_forced_dependence: true
+  use_boundary_constraint: true
+  use_uncertainty_constraint: true
+  use_repair: true
+  fallback: lagrangian
+baseline:
+  candidate_wise_only: false
+  risk_pressure_penalty_only: false
+loss:
+  lambda_rho: 1.0
+  lambda_tau: 1.0
+  lambda_c: 1.0
+  lambda_dist: 0.1
+  lambda_mani: 0.02
+training:
+  support_sizes: [0, 1, 2, 4, 8]
+  prob_empty_support: 0.4
+  batch_same_root_groups: 32
+  lr: 0.0002
+  weight_decay: 0.0001
+  warmup_steps: 5000
+  max_epochs: 30
+  max_steps: 200000
+  grad_clip_norm: 5.0
+  mixed_precision: true
+  class_weight_clip: [0.5, 5.0]
+output:
+  checkpoint_dir: outputs/checkpoints

@@ -1,0 +1,25 @@
+data:
+  source: womd
+  dt: 0.1
+  history_horizon_s: 1.0
+  future_horizon_s: 8.0
+  future_steps: 80
+  frame: ego_centered_t0
+  relevant_agents: 12
+rollout:
+  backend: waymax
+  ego_execution_mode: state_control
+  fallback_to_reactive: false
+  debug_allow_fallback: false
+  policy_variants:
+    - neutral_idm
+    - conservative_idm
+    - assertive_idm
+labels:
+  branch_set: [keep, cede, brake, accelerate, pass, nonconflict]
+  ceding_branches: [cede, brake]
+  d_near: 1.0
+  delta_cens_s: 1.0
+  eta_B: null
+  a_hard: null
+  j_hard: null

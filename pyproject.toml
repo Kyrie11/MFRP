@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mfrp-noncoercive-driving"
+version = "0.1.0"
+description = "MFRP: mechanism-feasible response planning for non-coercive autonomous driving"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{name = "MFRP implementation"}]
+dependencies = [
+  "numpy>=1.23",
+  "scipy>=1.9",
+  "torch>=2.0",
+  "PyYAML>=6.0",
+  "tqdm>=4.64",
+  "pandas>=1.5",
+  "shapely>=2.0"
+]
+
+[project.optional-dependencies]
+waymax = [
+  "jax>=0.4",
+  "jaxlib>=0.4",
+  "tensorflow>=2.12",
+  "waymo-waymax @ git+https://github.com/waymo-research/waymax.git@main#egg=waymo-waymax"
+]
+dev = ["pytest>=7.0", "ruff>=0.1"]
+
+[tool.setuptools.packages.find]
+include = ["mfrp*", "scope*", "scripts*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

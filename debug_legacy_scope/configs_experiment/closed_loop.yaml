@@ -1,0 +1,26 @@
+data:
+  split: test
+  allow_synthetic: false
+  synthetic_count: 8
+  dt: 0.1
+  future_horizon_s: 8.0
+rollout:
+  backend: waymax_state_control
+  fallback_to_reactive: false
+candidates:
+  candidate_count: 32
+planning:
+  epsilon_R: 0.05
+  epsilon_D: 0.10
+  epsilon_rho: 0.30
+  epsilon_B: 1.0
+  epsilon_U: 0.20
+  beta: 1.0
+  cvar_alpha: 0.1
+  use_forced_dependence: true
+  use_boundary_constraint: true
+  use_uncertainty_constraint: true
+  use_repair: true
+  fallback: lagrangian
+robustness:
+  policy_shifts: [default, aggressive_agents, conservative_agents, mixed_reactive_agents, low_candidate_density, scenario_stress]

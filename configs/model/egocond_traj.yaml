@@ -1,0 +1,20 @@
+seed: 17
+data:
+  split: train
+  dt: 0.1
+  future_horizon_s: 8.0
+model:
+  name: egocond_traj
+  hidden_dim: 256
+  trajectory_modes: 6
+baseline:
+  candidate_wise_only: true
+  risk_pressure_penalty_only: false
+training:
+  batch_same_root_groups: 32
+  lr: 0.0002
+  weight_decay: 0.0001
+  max_epochs: 30
+  max_steps: 200000
+output:
+  checkpoint_dir: outputs/checkpoints

@@ -1,0 +1,9 @@
+dataset_file: outputs/datasets/scope_womd_waymax/test_groups.jsonl.gz
+rho0: 2
+selectors:
+  - task_cost_only
+  - egocond_risk
+  - risk_pressure_penalty
+  - scope_wo_fd
+  - scope_wo_boundary
+  - scope_full

@@ -1,0 +1,16 @@
+seed: 17
+batch_size: 16
+max_epochs: 50
+optimizer:
+  name: adamw
+  lr: 0.0003
+  weight_decay: 0.01
+loss:
+  lambda_Y: 1.0
+  lambda_B: 1.0
+  lambda_H: 1.0
+  lambda_d: 0.1
+  lambda_g: 0.02
+  lambda_cw: 1.0
+  lambda_r: 0.5
+  detach_teacher: true

@@ -1,0 +1,7 @@
+defaults:
+  - ../model/scope_full.yaml
+baseline:
+  risk_pressure_penalty_only: true
+planning:
+  use_forced_dependence: false
+  use_boundary_constraint: false

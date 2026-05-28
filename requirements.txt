@@ -1,0 +1,7 @@
+numpy>=1.23
+scipy>=1.9
+torch>=2.0
+PyYAML>=6.0
+tqdm>=4.64
+pandas>=1.5
+shapely>=2.0

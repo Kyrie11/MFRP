@@ -1,0 +1,7 @@
+defaults:
+  - ../model/scope_full.yaml
+model:
+  use_support_query: false
+  use_support_adapted_loss: false
+loss:
+  lambda_dist: 0.0

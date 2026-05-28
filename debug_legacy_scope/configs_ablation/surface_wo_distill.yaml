@@ -1,0 +1,6 @@
+defaults:
+  - ../model/scope_full.yaml
+model:
+  use_distillation: false
+loss:
+  lambda_dist: 0.0

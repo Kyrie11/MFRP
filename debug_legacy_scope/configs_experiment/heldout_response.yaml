@@ -1,0 +1,18 @@
+checkpoint: outputs/checkpoints/scope.pt
+data_dir: outputs/datasets/scope_womd_waymax
+split: val
+metrics:
+  - branch_nll
+  - branch_accuracy
+  - ordinal_burden_mae
+  - high_pressure_auroc
+  - minADE
+  - minFDE
+  - risk_brier
+  - ece
+models:
+  - egocond_traj
+  - egocond_response
+  - surface_wo_support
+  - surface_wo_distill
+  - scope_full

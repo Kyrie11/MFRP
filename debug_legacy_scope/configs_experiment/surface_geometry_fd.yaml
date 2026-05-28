@@ -1,0 +1,13 @@
+checkpoint: outputs/checkpoints/scope.pt
+data_dir: outputs/datasets/scope_womd_waymax
+split: val
+rho0: 2
+delta: 0.1
+tau_d: 0.1
+metrics:
+  - boundary_auroc
+  - burden_kendall
+  - hp_auroc
+  - fd_auroc
+  - fd_ece
+  - false_safe_rate
