@@ -1,212 +1,119 @@
-"""Canonical MFRP data schema.
-
-This module contains only deployment-safe schema definitions and label
-containers for Mechanism-Feasible Response Planning (MFRP).  The response
-primitive is O_i(u)=(M_i,Y_i,DeltaB_i,H_i): soft branch, ego-frame future
-trajectory, continuous baseline-relative burden, and signed safety margin.
-"""
 from __future__ import annotations
 
-import dataclasses
+from dataclasses import dataclass, field
+from typing import Any, Mapping
 import hashlib
 import json
-from dataclasses import dataclass, field
-from typing import Any
-
 import numpy as np
 
-from mfrp.data.scene_schema import RootScene
-
-BRANCHES = ["keep", "cede", "brake", "accelerate", "pass", "nonconflict"]
-BRANCH_TO_INDEX = {name: i for i, name in enumerate(BRANCHES)}
-INDEX_TO_BRANCH = {i: name for name, i in BRANCH_TO_INDEX.items()}
-CEDING_BRANCHES = ["cede", "brake"]
-CEDING_BRANCH_IDS = [BRANCH_TO_INDEX[b] for b in CEDING_BRANCHES]
-STATE_DIM = 10  # x, y, z, vx, vy, speed, yaw, length, width, valid
-TRAJ_TARGET_DIM = 5  # canonical ego-centered t0 target: x, y, vx, vy, yaw
-DEFAULT_DT = 0.1
-DEFAULT_FUTURE_STEPS = 80
+BRANCHES = ("keep", "cede", "brake", "accelerate", "pass", "nonconflict")
+CEDING_BRANCHES = ("cede", "brake")
 
 
-def _as_f32(x: Any, shape: tuple[int, ...] | None = None) -> np.ndarray:
-    arr = np.asarray(x, dtype=np.float32)
-    if shape is not None and arr.shape != shape:
-        raise ValueError(f"expected shape {shape}, got {arr.shape}")
-    return arr
+def stable_hash(payload: Mapping[str, Any] | str) -> str:
+    if isinstance(payload, str):
+        raw = payload.encode("utf-8")
+    else:
+        raw = json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()[:16]
 
 
-def normalize_branch_probs(probs: Any, valid: bool = True) -> np.ndarray:
-    arr = _as_f32(probs)
-    if arr.shape != (len(BRANCHES),):
-        raise ValueError(f"branch_probs must be [{len(BRANCHES)}], got {arr.shape}")
-    arr = np.where(np.isfinite(arr), np.maximum(arr, 0.0), 0.0)
-    s = float(arr.sum())
-    if s <= 1e-8 or not valid:
-        return np.full(len(BRANCHES), 1.0 / len(BRANCHES), dtype=np.float32)
-    return (arr / s).astype(np.float32)
+@dataclass(frozen=True)
+class RootScene:
+    """Observed root scene only. Do not put future labels here."""
 
-
-@dataclass
-class CandidateValidity:
-    valid: bool = True
-    kinematic_feasible: bool = True
-    route_feasible: bool = True
-    map_feasible: bool = True
-    reason: str = ""
-
-
-@dataclass
-class EgoCandidate:
-    candidate_id: str
-    family: str
-    future_states_ego_frame: np.ndarray  # [T, 10], t0 ego frame
-    controls: np.ndarray | None = None
-    route_ids: list[int] = field(default_factory=list)
-    validity: CandidateValidity = field(default_factory=CandidateValidity)
-    nominal_cost: float = 0.0
+    scene_id: str
+    t0: int | float
+    history: np.ndarray  # [N, H, state_dim]
+    history_mask: np.ndarray  # [N, H]
+    ego_index: int = 0
+    map_features: np.ndarray | None = None
+    traffic_controls: np.ndarray | None = None
+    route_features: np.ndarray | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
-    def __post_init__(self) -> None:
-        self.future_states_ego_frame = _as_f32(self.future_states_ego_frame)
-        if self.future_states_ego_frame.ndim != 2 or self.future_states_ego_frame.shape[-1] != STATE_DIM:
-            raise ValueError("future_states_ego_frame must be [T,10]")
-        if self.controls is not None:
-            self.controls = _as_f32(self.controls)
-
     @property
-    def future_states(self) -> np.ndarray:
-        """Compatibility alias for migrated candidate-library utilities."""
-        return self.future_states_ego_frame
+    def root_hash(self) -> str:
+        safe = {"scene_id": self.scene_id, "t0": self.t0, "ego_index": self.ego_index}
+        return stable_hash(safe)
 
 
-@dataclass
-class ResponseObservation:
-    scenario_id: str
-    root_hash: str
+@dataclass(frozen=True)
+class EgoCandidate:
     candidate_id: str
-    agent_id: int
-    variant_id: str
-    branch_probs: np.ndarray
-    branch_hard: int
-    trajectory: np.ndarray
-    trajectory_valid: np.ndarray
-    burden: float
-    hp_label: float
-    safety_margin: float
-    near_collision: bool
-    priority_score: float
-    priority_confidence: float
-    interaction_features: dict[str, Any] = field(default_factory=dict)
-    branch_valid: bool = True
-    trajectory_valid_any: bool = True
-    burden_valid: bool = True
-    margin_valid: bool = True
-    hp_valid: bool = True
-    priority_valid: bool = True
-    rollout_valid: bool = True
-    diagnostics: dict[str, Any] = field(default_factory=dict)
-
-    def __post_init__(self) -> None:
-        self.branch_probs = normalize_branch_probs(self.branch_probs, self.branch_valid)
-        if self.branch_hard < 0 and self.branch_valid:
-            self.branch_hard = int(self.branch_probs.argmax())
-        if self.branch_hard >= len(BRANCHES):
-            raise ValueError(f"branch_hard out of range: {self.branch_hard}")
-        self.trajectory = _as_f32(self.trajectory)
-        if self.trajectory.ndim != 2 or self.trajectory.shape[-1] != TRAJ_TARGET_DIM:
-            raise ValueError("trajectory must be [T,5] in ego-centered t0 frame")
-        self.trajectory_valid = np.asarray(self.trajectory_valid, dtype=bool)
-        if self.trajectory_valid.shape != (self.trajectory.shape[0],):
-            raise ValueError("trajectory_valid must be [T]")
-        self.burden = float(self.burden)
-        self.hp_label = float(self.hp_label)
-        self.safety_margin = float(self.safety_margin)
-        self.priority_score = float(np.clip(self.priority_score, 0.0, 1.0))
-        self.priority_confidence = float(np.clip(self.priority_confidence, 0.0, 1.0))
-        self.trajectory_valid_any = bool(self.trajectory_valid_any and self.trajectory_valid.any())
-
-
-@dataclass
-class CoercionWitnessLabel:
-    scenario_id: str
-    root_hash: str
-    candidate_id: str
-    agent_id: int
-    soft_label: float
-    confidence: float
-    s_c: float
-    s_not_c: float
-    b_c: float
-    d_c: float
-    priority_score: float
-    diagnostics: dict[str, Any] = field(default_factory=dict)
-
-
-@dataclass
-class BoundaryPair:
-    candidate_id_a: str
-    candidate_id_b: str
-    agent_id: int
-    response_distance: float
-    boundary_label: float = 0.0
+    trajectory: np.ndarray  # [T, state_dim], ego frame at t0
+    features: np.ndarray  # deployment-safe a_i(u;s) base features, may be agent-independent
+    nominal_cost: float = 0.0
     valid: bool = True
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class ResponseObservation:
+    candidate_id: str
+    agent_id: str
+    variant_id: str
+    branch_probs: np.ndarray  # [6]
+    trajectory: np.ndarray  # [T, state_dim]
+    trajectory_mask: np.ndarray  # [T]
+    burden: float
+    safety_margin: float
+    high_pressure: bool
+    cw_soft_label: float = 0.0
+    cw_confidence: float = 0.0
+    priority_score_preexec: float = 0.5
+    priority_confidence_preexec: float = 0.0
+    diagnostics: dict[str, Any] = field(default_factory=dict)
+
+    def validate(self) -> None:
+        bp = np.asarray(self.branch_probs, dtype=np.float32)
+        if bp.shape != (len(BRANCHES),):
+            raise ValueError(f"branch_probs must have shape {(len(BRANCHES),)}, got {bp.shape}")
+        if not np.isfinite(bp).all() or bp.sum() <= 0:
+            raise ValueError("branch_probs must be finite and non-empty")
+        if not np.isfinite(float(self.burden)) or not np.isfinite(float(self.safety_margin)):
+            raise ValueError("burden and safety_margin must be finite")
+        if not (0.0 <= float(self.priority_score_preexec) <= 1.0):
+            raise ValueError("priority_score_preexec must be in [0,1]")
+        if not (0.0 <= float(self.priority_confidence_preexec) <= 1.0):
+            raise ValueError("priority_confidence_preexec must be in [0,1]")
 
 
 @dataclass
 class SameRootGroup:
-    scenario_id: str
-    root_hash: str
     root_scene: RootScene
     candidates: list[EgoCandidate]
-    relevant_agent_ids: list[int]
+    relevant_agent_ids: list[str]
     rollout_variants: list[str]
-    observations: dict[tuple[str, int, str], ResponseObservation] = field(default_factory=dict)
-    cw_labels: dict[tuple[str, int], CoercionWitnessLabel] = field(default_factory=dict)
-    boundary_pairs: list[BoundaryPair] = field(default_factory=list)
+    observations: dict[tuple[str, str, str], ResponseObservation]
     metadata: dict[str, Any] = field(default_factory=dict)
+    boundary_pairs: list[tuple[str, str, str, float]] = field(default_factory=list)  # agent_id, cand_a, cand_b, distance
 
-    def __post_init__(self) -> None:
-        if not self.root_hash:
-            self.root_hash = root_scene_hash(self.root_scene)
-        for c in self.candidates:
-            if any(key[0] == c.candidate_id for key in self.observations) and self.root_hash == c.candidate_id:
-                raise ValueError("root_hash must not be candidate-dependent")
-
-
-def root_scene_hash(root_scene: RootScene) -> str:
-    """Hash only observed root-scene information, never candidates or labels."""
-    payload = {
-        "scene_id": getattr(root_scene, "scene_id", ""),
-        "source": getattr(root_scene, "source", ""),
-        "current_time_index": int(getattr(root_scene, "current_time_index", 0)),
-        "dt": float(getattr(root_scene, "dt", DEFAULT_DT)),
-        "ego_track_index": int(getattr(root_scene, "ego_track_index", 0)),
-    }
-    try:
-        states = getattr(root_scene, "agent_tracks").states
-        # Only history/current slice is included by construction in RootScene.
-        payload["agent_shape"] = list(states.shape)
-        payload["agent_checksum"] = hashlib.sha1(np.asarray(states, dtype=np.float32).tobytes()).hexdigest()
-    except Exception:
-        pass
-    return hashlib.sha1(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()[:16]
-
-
-def asdict_json_safe(obj: Any) -> dict[str, Any]:
-    def conv(v: Any) -> Any:
-        if dataclasses.is_dataclass(v):
-            return {k: conv(val) for k, val in dataclasses.asdict(v).items()}
-        if isinstance(v, np.ndarray):
-            return v.tolist()
-        if isinstance(v, (np.integer,)):
-            return int(v)
-        if isinstance(v, (np.floating,)):
-            return float(v)
-        if isinstance(v, (np.bool_,)):
-            return bool(v)
-        if isinstance(v, dict):
-            return {str(k): conv(val) for k, val in v.items()}
-        if isinstance(v, (list, tuple)):
-            return [conv(x) for x in v]
-        return v
-    return conv(obj)
+    def validate(self, *, require_support_query_split: bool = True, allow_debug: bool = False) -> None:
+        if not self.candidates:
+            raise ValueError("SameRootGroup has no candidates")
+        if not self.relevant_agent_ids:
+            raise ValueError("SameRootGroup has no relevant agents")
+        if not self.rollout_variants:
+            raise ValueError("SameRootGroup has no rollout variants")
+        if self.metadata.get("uses_log_playback_for_response") and not allow_debug:
+            raise ValueError("log playback cannot be used as response supervision for paper data")
+        if len(self.rollout_variants) < 2 and not allow_debug:
+            raise ValueError("forced-dependence supervision needs at least two rollout variants")
+        cand_ids = {c.candidate_id for c in self.candidates}
+        agent_ids = set(self.relevant_agent_ids)
+        variant_ids = set(self.rollout_variants)
+        for key, obs in self.observations.items():
+            c, a, r = key
+            if c not in cand_ids or a not in agent_ids or r not in variant_ids:
+                raise ValueError(f"observation key {key} is outside group ids")
+            obs.validate()
+        if require_support_query_split:
+            support = set(self.metadata.get("support_candidate_ids", []))
+            query = set(self.metadata.get("query_candidate_ids", []))
+            if not support or not query:
+                raise ValueError("metadata must contain non-empty support_candidate_ids and query_candidate_ids")
+            if support & query:
+                raise ValueError("support/query candidate ids overlap")
+            if not support <= cand_ids or not query <= cand_ids:
+                raise ValueError("support/query ids must be candidate ids")

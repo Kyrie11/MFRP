@@ -1,79 +1,44 @@
-"""Offline metrics for MFRP response prediction and mechanism risk."""
 from __future__ import annotations
 
-from typing import Any
 import numpy as np
-import torch
-import torch.nn.functional as F
 
 
-def masked_mean_np(values: np.ndarray, mask: np.ndarray) -> float | None:
-    values = np.asarray(values, dtype=float)
-    mask = np.asarray(mask, dtype=bool)
-    if values.size == 0 or not mask.any():
+def binary_auroc(score: np.ndarray, target: np.ndarray) -> float | None:
+    score = np.asarray(score).reshape(-1)
+    target = np.asarray(target).astype(bool).reshape(-1)
+    mask = np.isfinite(score)
+    score, target = score[mask], target[mask]
+    pos = score[target]; neg = score[~target]
+    if len(pos) == 0 or len(neg) == 0:
         return None
-    return float(np.mean(values[mask]))
+    ranks = np.argsort(np.argsort(np.concatenate([pos, neg]))) + 1
+    rpos = ranks[: len(pos)].sum()
+    return float((rpos - len(pos) * (len(pos) + 1) / 2) / (len(pos) * len(neg)))
 
 
-def binary_auroc(y_true: np.ndarray, y_score: np.ndarray) -> float | None:
-    y_true = np.asarray(y_true).reshape(-1).astype(int)
-    y_score = np.asarray(y_score).reshape(-1).astype(float)
-    finite = np.isfinite(y_score)
-    y_true, y_score = y_true[finite], y_score[finite]
-    pos = y_true == 1; neg = y_true == 0
-    if pos.sum() == 0 or neg.sum() == 0:
+def expected_calibration_error(prob: np.ndarray, target: np.ndarray, bins: int = 10) -> float | None:
+    prob = np.asarray(prob).reshape(-1)
+    target = np.asarray(target).reshape(-1)
+    mask = np.isfinite(prob) & np.isfinite(target)
+    if mask.sum() == 0:
         return None
-    order = np.argsort(y_score)
-    ranks = np.empty_like(order, dtype=float)
-    ranks[order] = np.arange(1, len(y_score) + 1)
-    # Average tied ranks.
-    for val in np.unique(y_score):
-        idx = np.where(y_score == val)[0]
-        if len(idx) > 1:
-            ranks[idx] = ranks[idx].mean()
-    return float((ranks[pos].sum() - pos.sum() * (pos.sum() + 1) / 2) / (pos.sum() * neg.sum()))
+    prob, target = prob[mask], target[mask]
+    ece = 0.0
+    for lo, hi in zip(np.linspace(0, 1, bins, endpoint=False), np.linspace(1 / bins, 1, bins)):
+        m = (prob >= lo) & (prob < hi if hi < 1 else prob <= hi)
+        if m.any():
+            ece += float(m.mean() * abs(prob[m].mean() - target[m].mean()))
+    return ece
 
 
-def response_prediction_metrics(outputs: dict, batch: dict) -> dict[str, Any]:
-    metrics: dict[str, Any] = {}
-    pmask = batch.get("query_probe_mask", batch.get("variant_valid"))
-    if pmask is None:
-        return metrics
-    pmask = pmask.bool()
-    if "branch_probs" in batch:
-        target = batch["branch_probs"].float()
-        pred_log = F.log_softmax(outputs["branch_logits"], dim=-1).unsqueeze(3)
-        ce = -(target * pred_log).sum(dim=-1)
-        metrics["branch_ce"] = float(ce[pmask].mean().detach().cpu()) if pmask.any() else None
-        hard_t = target.argmax(dim=-1)
-        hard_p = outputs["branch_logits"].argmax(dim=-1).unsqueeze(3).expand_as(hard_t)
-        metrics["branch_acc"] = float((hard_p[pmask] == hard_t[pmask]).float().mean().detach().cpu()) if pmask.any() else None
-    if "burden" in batch:
-        pred = outputs["burden_loc"].mean(dim=-1).unsqueeze(3)
-        err = torch.abs(pred - batch["burden"].float())
-        metrics["burden_mae"] = float(err[pmask].mean().detach().cpu()) if pmask.any() else None
-    if "safety_margin" in batch:
-        pred = outputs["margin_loc"].mean(dim=-1).unsqueeze(3)
-        err = torch.abs(pred - batch["safety_margin"].float())
-        metrics["margin_mae"] = float(err[pmask].mean().detach().cpu()) if pmask.any() else None
-    if "trajectory" in batch and "trajectory_mask" in batch:
-        loc = outputs["trajectory"]["loc"].mean(dim=-3).mean(dim=-3).unsqueeze(3)  # [B,A,K,1,T,D]
-        tgt = batch["trajectory"].float()
-        tmask = batch["trajectory_mask"].bool() & pmask.unsqueeze(-1)
-        ade = torch.linalg.norm(loc[..., :2] - tgt[..., :2], dim=-1)
-        metrics["traj_ade"] = float(ade[tmask].mean().detach().cpu()) if tmask.any() else None
-    return metrics
-
-
-def aggregate_metric_dicts(rows: list[dict[str, Any]]) -> dict[str, Any]:
-    out: dict[str, Any] = {}
-    keys = sorted({k for r in rows for k in r})
-    for k in keys:
-        vals = [r[k] for r in rows if r.get(k) is not None]
-        if not vals:
-            out[k] = None
-        elif isinstance(vals[0], (int, float, np.floating)):
-            out[k] = float(np.mean(vals))
-        else:
-            out[k] = vals[-1]
-    return out
+def prediction_metrics(pred: dict[str, np.ndarray], truth: dict[str, np.ndarray]) -> dict[str, float | None]:
+    branch_p = pred["branch_prob"]
+    branch_t = truth["branch_probs"]
+    mask = truth.get("query_probe_mask", truth.get("variant_valid", np.ones(branch_t.shape[:-1], dtype=bool))).astype(bool)
+    ce = -(branch_t * np.log(np.expand_dims(branch_p, 3).clip(1e-8, 1))).sum(-1)
+    hard_p = branch_p.argmax(-1)[..., None]
+    hard_t = branch_t.argmax(-1)
+    return {
+        "branch_ce": float(ce[mask].mean()) if mask.any() else None,
+        "branch_acc": float((hard_p == hard_t)[mask].mean()) if mask.any() else None,
+    }

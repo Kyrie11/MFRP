@@ -1,41 +1,31 @@
-"""Mechanism-feasible selector and conservative fallback."""
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Any
-
-import numpy as np
+import torch
+from .estimators import mechanism_estimates
 
 
-@dataclass
-class SelectionResult:
-    index: int
-    candidate_id: str
-    fallback_used: bool
-    feasible_mask: np.ndarray
-    active_violations: dict[str, bool]
-    scores: np.ndarray
-
-
-def mechanism_feasible_mask(rho_mech_cal: np.ndarray, uncertainty: np.ndarray, sensitivity: np.ndarray, candidate_valid: np.ndarray, alpha: float, nu_bar: float, gamma_bar: float) -> np.ndarray:
-    return (rho_mech_cal <= alpha) & (uncertainty <= nu_bar) & (sensitivity <= gamma_bar) & candidate_valid.astype(bool)
-
-
-def select_mechanism_feasible(candidates: list[Any], rho_mech_cal: np.ndarray, uncertainty: np.ndarray, sensitivity: np.ndarray, candidate_valid: np.ndarray | None = None, alpha: float = 0.05, nu_bar: float = 0.3, gamma_bar: float = 2.0, lambda_risk: float = 10.0, lambda_unc: float = 1.0, lambda_gamma: float = 1.0) -> SelectionResult:
-    n = len(candidates)
-    if candidate_valid is None:
-        candidate_valid = np.ones(n, dtype=bool)
-    rho = np.asarray(rho_mech_cal, dtype=float).reshape(n)
-    nu = np.asarray(uncertainty, dtype=float).reshape(n)
-    gam = np.asarray(sensitivity, dtype=float).reshape(n)
-    valid = np.asarray(candidate_valid, dtype=bool).reshape(n)
-    nominal = np.asarray([float(getattr(c, "nominal_cost", 0.0)) for c in candidates], dtype=float)
-    feasible = mechanism_feasible_mask(rho, nu, gam, valid, alpha, nu_bar, gamma_bar)
-    if feasible.any():
-        masked = np.where(feasible, nominal, np.inf)
-        idx = int(np.argmin(masked))
-        return SelectionResult(idx, str(getattr(candidates[idx], "candidate_id", idx)), False, feasible, {}, masked)
-    scores = nominal + lambda_risk * np.maximum(0.0, rho - alpha) + lambda_unc * np.maximum(0.0, nu - nu_bar) + lambda_gamma * np.maximum(0.0, gam - gamma_bar) + np.where(valid, 0.0, 1e6)
-    idx = int(np.argmin(scores))
-    active = {"risk": bool(rho[idx] > alpha), "uncertainty": bool(nu[idx] > nu_bar), "sensitivity": bool(gam[idx] > gamma_bar), "candidate_invalid": bool(not valid[idx])}
-    return SelectionResult(idx, str(getattr(candidates[idx], "candidate_id", idx)), True, feasible, active, scores)
+def select_mechanism_feasible(
+    out: dict[str, torch.Tensor],
+    batch: dict[str, torch.Tensor],
+    *,
+    alpha: float = 0.05,
+    q_beta: float = 0.0,
+    nu_bar: float = 0.3,
+    gamma_bar: float | None = None,
+    prefix: str = "scene",
+) -> dict[str, torch.Tensor]:
+    est = mechanism_estimates(out, prefix=prefix)
+    rho_cal = (est["rho_mech"] + q_beta).clamp(max=1.0)
+    valid = batch.get("candidate_valid")
+    if valid is None:
+        valid = torch.ones_like(rho_cal, dtype=torch.bool)
+    feasible = (rho_cal <= alpha) & (est["nu"] <= nu_bar) & valid.bool().to(rho_cal.device)
+    nominal = batch.get("nominal_cost", torch.zeros_like(rho_cal)).to(rho_cal.device)
+    big = torch.full_like(nominal, 1e6)
+    feas_cost = torch.where(feasible, nominal, big)
+    idx = torch.argmin(feas_cost, dim=-1)
+    fallback = ~feasible.any(dim=-1)
+    fallback_score = nominal + 10.0 * rho_cal + est["nu"]
+    fb_idx = torch.argmin(torch.where(valid.bool().to(rho_cal.device), fallback_score, big), dim=-1)
+    idx = torch.where(fallback, fb_idx, idx)
+    return {"selected_index": idx, "fallback_used": fallback, "feasible_mask": feasible, "rho_mech_cal": rho_cal, **est}

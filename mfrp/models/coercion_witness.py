@@ -1,4 +1,3 @@
-"""Learned monotone coercion witness for MFRP."""
 from __future__ import annotations
 
 import torch
@@ -6,23 +5,28 @@ from torch import nn
 import torch.nn.functional as F
 
 
-class MonotoneCoercionWitnessHead(nn.Module):
-    """Monotone in P_C, D_C, B_C and anti-monotone in priority.
+class MonotoneCoercionWitness(nn.Module):
+    """κ head monotone in pressure/dependence/burden, anti-monotone in priority.
 
-    The flexible residual intentionally receives only S_C, S_notC and latent
-    features so it cannot directly undo the required monotonicity constraints.
+    Inputs are [P_C, S_C, S_notC, D_C, B_C, priority, latent...].
     """
-    def __init__(self, latent_dim: int, hidden_dim: int = 128):
-        super().__init__()
-        self.w_pos_raw = nn.Parameter(torch.zeros(3))
-        self.w_prio_raw = nn.Parameter(torch.zeros(1))
-        self.flex = nn.Sequential(nn.Linear(latent_dim + 2, hidden_dim), nn.ReLU(), nn.Linear(hidden_dim, 1))
-        self.bias = nn.Parameter(torch.zeros(()))
 
-    def forward(self, P_C: torch.Tensor, D_C: torch.Tensor, B_C: torch.Tensor, priority: torch.Tensor, S_C: torch.Tensor, S_notC: torch.Tensor, latent: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        w_pos = F.softplus(self.w_pos_raw)
-        w_prio = F.softplus(self.w_prio_raw)
-        mono = w_pos[0] * P_C + w_pos[1] * D_C + w_pos[2] * B_C - w_prio * priority
-        flex_in = torch.cat([S_C.unsqueeze(-1), S_notC.unsqueeze(-1), latent], dim=-1)
-        logits = self.bias + mono + self.flex(flex_in).squeeze(-1)
-        return logits, torch.sigmoid(logits)
+    def __init__(self, latent_dim: int, hidden_dim: int = 64):
+        super().__init__()
+        self.free = nn.Sequential(nn.Linear(latent_dim + 2, hidden_dim), nn.SiLU(), nn.Linear(hidden_dim, 1))
+        self.raw_pos = nn.Parameter(torch.zeros(3))  # P_C, D_C, B_C
+        self.raw_priority = nn.Parameter(torch.zeros(()))
+        self.bias = nn.Parameter(torch.tensor(-2.0))
+
+    def forward(self, features: torch.Tensor, latent: torch.Tensor) -> torch.Tensor:
+        p_c = features[..., 0]
+        s_c = features[..., 1]
+        s_nc = features[..., 2]
+        d_c = features[..., 3]
+        b_c = features[..., 4]
+        priority = features[..., 5]
+        pos_w = F.softplus(self.raw_pos)
+        prio_w = F.softplus(self.raw_priority)
+        mono = pos_w[0] * p_c + pos_w[1] * d_c + pos_w[2] * b_c - prio_w * priority
+        free_in = torch.cat([torch.stack([s_c, s_nc], -1), latent], dim=-1)
+        return torch.sigmoid(mono + self.free(free_in).squeeze(-1) + self.bias)

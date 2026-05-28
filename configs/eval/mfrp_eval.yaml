@@ -1,17 +1,4 @@
-metrics:
-  - branch_nll
-  - branch_accuracy
-  - burden_mae
-  - margin_nll
-  - margin_mae
-  - risk_brier
-  - risk_ece
-  - coercion_auroc
-  - false_safe_rate
-  - boundary_auroc
-  - burden_kendall_tau
-planning:
-  alpha: 0.05
-  beta_calibration: 0.1
-  nu_bar: 0.3
-  gamma_bar: 2.0
+metrics: [prediction, false_safe, boundary, calibration]
+alpha: 0.05
+nu_bar: 0.3
+gamma_bar: 2.0

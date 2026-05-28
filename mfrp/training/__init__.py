@@ -1,1 +1,1 @@
-from mfrp.training.losses import total_mfrp_loss, mechanism_nll, response_geometry_loss, distillation_loss, coercion_witness_loss
+from .losses import total_mfrp_loss, mechanism_nll, distillation_loss, geometry_loss, cw_loss

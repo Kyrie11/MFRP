@@ -1,21 +1,16 @@
-"""Deployment entry points. Deployment is scene-only by construction."""
 from __future__ import annotations
 
-import torch
-
-
 LABEL_SIDE_KEYS = {
-    "support_probe_features", "support_probe_mask", "query_probe_mask",
-    "branch_probs", "branch_hard", "trajectory", "trajectory_mask",
-    "burden", "hp_label", "safety_margin", "variant_valid",
-    "cw_soft_label", "cw_confidence", "cw_rank_pairs", "cw_rank_valid",
-    # Legacy priority values are label-side unless explicitly rebuilt as *_preexec.
-    "priority_score", "priority_confidence",
-    "diagnostics", "groups",
+    "branch_probs", "trajectory", "trajectory_mask", "burden", "safety_margin", "variant_valid",
+    "support_probe_features", "support_probe_mask", "query_probe_mask", "cw_soft_label", "cw_confidence",
+    "priority_score", "priority_confidence", "groups", "observations", "rollout_diagnostics",
 }
 
 
-def scene_only_inference(model, batch: dict) -> dict:
-    clean = {k: v for k, v in batch.items() if k not in LABEL_SIDE_KEYS}
-    with torch.no_grad():
-        return model(clean, mode="scene_only")["scene_only"]
+def sanitize_deployment_batch(batch: dict) -> dict:
+    return {k: v for k, v in batch.items() if k not in LABEL_SIDE_KEYS}
+
+
+def scene_only_inference(model, batch: dict):
+    clean = sanitize_deployment_batch(batch)
+    return model(clean, mode="scene_only")
