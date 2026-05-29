@@ -490,30 +490,41 @@ def build_groups(*, womd_pattern: str, split: str, config: dict[str, Any], max_s
     effective_womd_pattern = womd_pattern
     if not paths and womd_pattern.endswith(".tfrecord"):
         effective_womd_pattern = womd_pattern + "*"
-    print(f"[MFRP] Matched {len(paths)} WOMD TFRecord shards with pattern: {effective_womd_pattern}")
+        paths = sorted(glob.glob(effective_womd_pattern))
     if not paths:
         raise FileNotFoundError(f"No WOMD TFExample files match: {womd_pattern}")
+    print(f"[MFRP] Matched {len(paths)} WOMD TFRecord shards with pattern: {effective_womd_pattern}")
+
     data_cfg = config.get("dataset", {})
     adapter_cfg = config.get("adapter", {})
     rollout_cache = adapter_cfg.get("rollout_cache")
     generate_online = bool(adapter_cfg.get("generate_online_rollouts", config.get("rollout", {}).get("generate_online", True)))
     max_objects = int(data_cfg.get("max_num_objects", 128))
-    if hasattr(wx_config, "DatasetConfig"):
-        kwargs = {"path": effective_womd_pattern, "max_num_objects": max_objects}
-        if hasattr(wx_config, "DataFormat") and hasattr(wx_config.DataFormat, "TFRECORD"):
-            kwargs["data_format"] = wx_config.DataFormat.TFRECORD
-        ds_cfg = wx_config.DatasetConfig(**kwargs)
-    else:
-        base = getattr(wx_config, "WOD_1_1_0_TRAINING")
-        ds_cfg = dataclasses.replace(base, path=effective_womd_pattern, max_num_objects=max_objects)
-    iterator = dataloader.simulator_state_generator(config=ds_cfg)
+
+    def _make_iterator(path: str):
+        if hasattr(wx_config, "DatasetConfig"):
+            kwargs = {"path": path, "max_num_objects": max_objects}
+            if hasattr(wx_config, "DataFormat") and hasattr(wx_config.DataFormat, "TFRECORD"):
+                kwargs["data_format"] = wx_config.DataFormat.TFRECORD
+            ds_cfg = wx_config.DatasetConfig(**kwargs)
+        else:
+            base = getattr(wx_config, "WOD_1_1_0_TRAINING")
+            ds_cfg = dataclasses.replace(base, path=path, max_num_objects=max_objects)
+        return dataloader.simulator_state_generator(config=ds_cfg)
+
     variants = _parse_variants(adapter_cfg or config.get("rollout", {}))
     future_steps = int(data_cfg.get("future_steps", config.get("tensor", {}).get("future_steps", 80)))
     count = 0
-    for idx, state in enumerate(iterator):
-        if max_scenarios is not None and count >= max_scenarios:
-            break
-        root, arr, ego0_world = _make_root_scene(state, split, idx, config)
+    global_idx = 0
+    for shard_path in paths:
+        print(f"[MFRP] Reading WOMD shard: {shard_path}")
+        iterator = _make_iterator(shard_path)
+        for state in iterator:
+            if max_scenarios is not None and count >= max_scenarios:
+                return
+            idx = global_idx
+            global_idx += 1
+            root, arr, ego0_world = _make_root_scene(state, split, idx, config)
         candidates = _generate_candidates(root, arr, ego0_world, config)
         agents = _select_relevant_agents(root, config)
         if not agents or len(candidates) < 2:
