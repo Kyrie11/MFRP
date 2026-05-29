@@ -505,7 +505,8 @@ def build_groups(*, womd_pattern: str, split: str, config: dict[str, Any], max_s
         ds_cfg = wx_config.DatasetConfig(**kwargs)
     else:
         base = getattr(wx_config, "WOD_1_1_0_TRAINING")
-        ds_cfg = dataclasses.replace(base, path=effective_womd_pattern, max_num_objects=max_objects)    iterator = dataloader.simulator_state_generator(config=ds_cfg)
+        ds_cfg = dataclasses.replace(base, path=effective_womd_pattern, max_num_objects=max_objects)
+    iterator = dataloader.simulator_state_generator(config=ds_cfg)
     variants = _parse_variants(adapter_cfg or config.get("rollout", {}))
     future_steps = int(data_cfg.get("future_steps", config.get("tensor", {}).get("future_steps", 80)))
     count = 0
