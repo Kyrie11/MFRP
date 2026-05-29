@@ -487,6 +487,10 @@ def build_groups(*, womd_pattern: str, split: str, config: dict[str, Any], max_s
     """Yield schema-valid SameRootGroup objects from WOMD loaded by Waymax."""
     wx_config, dataloader = _require_waymax()
     paths = sorted(glob.glob(womd_pattern))
+    effective_womd_pattern = womd_pattern
+    if not paths and womd_pattern.endswith(".tfrecord"):
+        effective_womd_pattern = womd_pattern + "*"
+    print(f"[MFRP] Matched {len(paths)} WOMD TFRecord shards with pattern: {effective_womd_pattern}")
     if not paths:
         raise FileNotFoundError(f"No WOMD TFExample files match: {womd_pattern}")
     data_cfg = config.get("dataset", {})
@@ -495,14 +499,13 @@ def build_groups(*, womd_pattern: str, split: str, config: dict[str, Any], max_s
     generate_online = bool(adapter_cfg.get("generate_online_rollouts", config.get("rollout", {}).get("generate_online", True)))
     max_objects = int(data_cfg.get("max_num_objects", 128))
     if hasattr(wx_config, "DatasetConfig"):
-        kwargs = {"path": ",".join(paths), "max_num_objects": max_objects}
+        kwargs = {"path": effective_womd_pattern, "max_num_objects": max_objects}
         if hasattr(wx_config, "DataFormat") and hasattr(wx_config.DataFormat, "TFRECORD"):
             kwargs["data_format"] = wx_config.DataFormat.TFRECORD
         ds_cfg = wx_config.DatasetConfig(**kwargs)
     else:
         base = getattr(wx_config, "WOD_1_1_0_TRAINING")
-        ds_cfg = dataclasses.replace(base, path=",".join(paths), max_num_objects=max_objects)
-    iterator = dataloader.simulator_state_generator(config=ds_cfg)
+        ds_cfg = dataclasses.replace(base, path=effective_womd_pattern, max_num_objects=max_objects)    iterator = dataloader.simulator_state_generator(config=ds_cfg)
     variants = _parse_variants(adapter_cfg or config.get("rollout", {}))
     future_steps = int(data_cfg.get("future_steps", config.get("tensor", {}).get("future_steps", 80)))
     count = 0
