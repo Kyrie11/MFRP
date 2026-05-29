@@ -13,14 +13,14 @@ pip install -e .
 
 ## 1. Dataset generation
 
-The Waymax adapter intentionally refuses log playback labels. First generate real reactive rollout cache for each `(scene, candidate, variant, agent)`, then materialize NPZ shards:
+The Waymax adapter now performs online same-root reactive rollouts from WOMD scenarios loaded by Waymax. It injects each ego candidate and rolls surrounding vehicles with IDM-style route-following policy variants. Log playback is still rejected as response supervision; an optional `adapter.rollout_cache` can be used only to override the online rollout with precomputed real reactive trajectories.
 
 ```bash
 python scripts/build_same_root_dataset.py \
   --config configs/data/mfrp_womd_waymax.yaml \
   --split train \
   --out outputs/datasets/mfrp_womd_waymax \
-  --womd-pattern "/path/to/womd/train/*.tfrecord" \
+  --womd-pattern "/data0/senzeyu2/dataset/WOMD/waymo_open_dataset_motion_v_1_3_1/uncompressed/tf_example//training/*.tfrecord" \
   --adapter examples.mfrp_waymax_adapter:build_groups \
   --max-scenarios 20000 \
   --shard-size 8

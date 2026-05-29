@@ -7,6 +7,7 @@ rollout:
   backend: waymax
   ego_execution_mode: state_control
   debug_allow_fallback: false
+  generate_online: true
   policy_variants: [neutral_idm, conservative_idm, assertive_idm]
 labels:
   branch_set: [keep, cede, brake, accelerate, pass, nonconflict]
@@ -17,3 +18,23 @@ planning:
   beta_calibration: 0.1
   nu_bar: 0.3
   gamma_bar: 2.0
+
+adapter:
+  generate_online_rollouts: true
+  rollout_cache: null
+  variants:
+    - {name: neutral_idm, aggressiveness: 1.0, desired_speed_scale: 1.0, min_gap_scale: 1.0, safe_time_headway: 1.5, max_accel: 2.0, max_decel: 4.0}
+    - {name: conservative_idm, aggressiveness: 0.7, desired_speed_scale: 0.9, min_gap_scale: 1.35, safe_time_headway: 2.1, max_accel: 1.6, max_decel: 4.5}
+    - {name: assertive_idm, aggressiveness: 1.3, desired_speed_scale: 1.12, min_gap_scale: 0.70, safe_time_headway: 0.9, max_accel: 2.6, max_decel: 5.0}
+dataset:
+  history_steps: 11
+  future_steps: 80
+  future_horizon_s: 8.0
+  max_num_objects: 128
+  candidates_per_group: 24
+  max_agents_per_group: 8
+  relevant_radius_m: 60.0
+  query_fraction: 0.35
+  speed_scales: [0.75, 0.9, 1.0, 1.1, 1.25]
+  timing_delays_s: [-0.4, -0.2, 0.0, 0.2, 0.4, 0.8]
+  lateral_offsets_m: [0.0]

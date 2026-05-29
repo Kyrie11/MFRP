@@ -7,7 +7,7 @@ This package implements the code path required by the paper idea: same-root inte
 `build_same_root_dataset --adapter` is **not** a YAML option, class name, or built-in keyword. It must be an importable Python callable in this exact form:
 
 ```bash
---adapter my_project.mfrp_waymax_adapter:build_groups
+--adapter examples.mfrp_waymax_adapter:build_groups
 ```
 
 The callable signature must be:
@@ -18,7 +18,7 @@ def build_groups(*, womd_pattern: str, split: str, config: dict,
     ...
 ```
 
-The adapter must return `SameRootGroup` objects generated from real same-root WOMD/Waymax rollouts. The repository cannot include your private WOMD paths or local Waymax scenario loader, so `examples/mfrp_waymax_adapter_template.py` is only a template and intentionally raises `NotImplementedError`.
+The adapter must return `SameRootGroup` objects generated from real same-root WOMD/Waymax rollouts. This bundle includes `examples.mfrp_waymax_adapter:build_groups`, which loads WOMD through Waymax, injects each ego candidate, and generates same-root route-following IDM reactive responses online. Optional precomputed rollout cache files are still supported, but are no longer required.
 
 ## Recommended paper commands
 
@@ -28,7 +28,7 @@ python -m scripts.build_same_root_dataset \
   --split train \
   --out outputs/datasets/mfrp_womd_waymax \
   --womd-pattern '/data/womd/motion/train/*.tfrecord*' \
-  --adapter my_project.mfrp_waymax_adapter:build_groups \
+  --adapter examples.mfrp_waymax_adapter:build_groups \
   --max-scenarios 10000 \
   --num-workers 8 \
   --shard-size 8
