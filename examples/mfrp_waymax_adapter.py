@@ -22,6 +22,7 @@ import dataclasses
 from pathlib import Path
 from typing import Any, Iterator
 import glob
+from tqdm.auto import tqdm
 import math
 import numpy as np
 
@@ -516,82 +517,87 @@ def build_groups(*, womd_pattern: str, split: str, config: dict[str, Any], max_s
     future_steps = int(data_cfg.get("future_steps", config.get("tensor", {}).get("future_steps", 80)))
     count = 0
     global_idx = 0
-    for shard_path in paths:
-        print(f"[MFRP] Reading WOMD shard: {shard_path}")
+    shard_iter = tqdm(paths, desc="WOMD shards", unit="shard") if tqdm else paths
+    for shard_path in shard_iter:
+        if tqdm is None:
+            print(f"[MFRP] Reading WOMD shard: {shard_path}")
         iterator = _make_iterator(shard_path)
-        for state in iterator:
+        state_iter = tqdm(iterator, desc="scenarios", unit="scene", leave=False) if tqdm else iterator
+        for state in state_iter:
             if max_scenarios is not None and count >= max_scenarios:
                 return
             idx = global_idx
             global_idx += 1
             root, arr, ego0_world = _make_root_scene(state, split, idx, config)
-        candidates = _generate_candidates(root, arr, ego0_world, config)
-        agents = _select_relevant_agents(root, config)
-        if not agents or len(candidates) < 2:
-            continue
-        support, query = _support_query_split(candidates, config)
-        group = SameRootGroup(
-            root_scene=root,
-            candidates=candidates,
-            relevant_agent_ids=agents,
-            rollout_variants=[v.name for v in variants],
-            observations={},
-            metadata={
-                "support_candidate_ids": support,
-                "query_candidate_ids": query,
-                "uses_log_playback_for_response": False,
-                "reactive_rollout_backend": "waymax_womd_route_idm_online" if generate_online else "cache",
-                "adapter": "examples.mfrp_waymax_adapter",
-            },
-        )
-        all_obs = []
-        for c in candidates:
-            c_meta = dict(c.metadata)
-            c_meta.setdefault("agent_features", {})
-            for aid in agents:
-                neutral_ref = _agent_neutral_future(root, arr, ego0_world, aid, future_steps)
-                pre_feat = _make_agent_interaction_features(c, neutral_ref, neutral_ref, root.dt)
-                pr = compute_priority_score(pre_feat)
-                c_meta["agent_features"][aid] = {"interaction_features": np.array([
-                    pre_feat.get("tau_ego_in", 0.0), pre_feat.get("tau_i0_in", 0.0), pre_feat.get("entry_time_gap", 0.0),
-                    pre_feat.get("min_distance", 0.0), pr.score, pr.confidence,
-                ], dtype=np.float32)}
-                for v in variants:
-                    agent_traj = _load_cached_rollout(rollout_cache, root.scene_id, c.candidate_id, v.name, aid)
-                    if agent_traj is None:
-                        if not generate_online:
-                            raise RuntimeError(
-                                "Missing rollout_cache item and adapter.generate_online_rollouts=false. "
-                                "Either enable online Waymax/WOMD IDM rollout or provide cache files."
-                            )
-                        agent_traj = _idm_reactive_rollout(neutral_ref, c.trajectory, v, dt=root.dt)
-                    n = min(len(c.trajectory), len(agent_traj), len(neutral_ref))
-                    inter_feat = _make_agent_interaction_features(c, neutral_ref[:n], agent_traj[:n], root.dt)
-                    obs = make_response_observation(
-                        root.scene_id, root.root_hash, c.candidate_id, aid, v.name,
-                        c.trajectory[:n], agent_traj[:n], neutral_ref[:n], inter_feat,
-                        pr.score, pr.confidence, dt=root.dt,
-                    )
-                    group.observations[(c.candidate_id, aid, v.name)] = obs
-                    all_obs.append(obs)
-            # dataclass is frozen; replace candidate metadata with preexec per-agent features.
-            object.__setattr__(c, "metadata", c_meta)
-        # Fill CW labels back into observations and group metadata for tensor collation.
-        from mfrp.data.label_extraction import coercion_witness_label
-        cw_labels: dict[tuple[str, str], Any] = {}
-        for c in candidates:
-            for aid in agents:
-                lab = coercion_witness_label(all_obs, c.candidate_id, aid, root.root_hash, root.scene_id)
-                cw_labels[(c.candidate_id, aid)] = lab
-                for v in variants:
-                    key = (c.candidate_id, aid, v.name)
-                    obs = group.observations.get(key)
-                    if obs is not None:
-                        object.__setattr__(obs, "cw_soft_label", float(lab.soft_label))
-                        object.__setattr__(obs, "cw_confidence", float(lab.confidence))
-        group.metadata["cw_labels"] = {f"{k[0]}|{k[1]}": dataclasses.asdict(v) if dataclasses.is_dataclass(v) else str(v) for k, v in cw_labels.items()}
-        group.boundary_pairs = _boundary_pairs(group)
-        if not group.observations:
-            continue
-        count += 1
-        yield group
+            candidates = _generate_candidates(root, arr, ego0_world, config)
+            agents = _select_relevant_agents(root, config)
+            if not agents or len(candidates) < 2:
+                continue
+            support, query = _support_query_split(candidates, config)
+            group = SameRootGroup(
+                root_scene=root,
+                candidates=candidates,
+                relevant_agent_ids=agents,
+                rollout_variants=[v.name for v in variants],
+                observations={},
+                metadata={
+                    "support_candidate_ids": support,
+                    "query_candidate_ids": query,
+                    "uses_log_playback_for_response": False,
+                    "reactive_rollout_backend": "waymax_womd_route_idm_online" if generate_online else "cache",
+                    "adapter": "examples.mfrp_waymax_adapter",
+                },
+            )
+            all_obs = []
+            for c in candidates:
+                c_meta = dict(c.metadata)
+                c_meta.setdefault("agent_features", {})
+                for aid in agents:
+                    neutral_ref = _agent_neutral_future(root, arr, ego0_world, aid, future_steps)
+                    pre_feat = _make_agent_interaction_features(c, neutral_ref, neutral_ref, root.dt)
+                    pr = compute_priority_score(pre_feat)
+                    c_meta["agent_features"][aid] = {"interaction_features": np.array([
+                        pre_feat.get("tau_ego_in", 0.0), pre_feat.get("tau_i0_in", 0.0), pre_feat.get("entry_time_gap", 0.0),
+                        pre_feat.get("min_distance", 0.0), pr.score, pr.confidence,
+                    ], dtype=np.float32)}
+                    for v in variants:
+                        agent_traj = _load_cached_rollout(rollout_cache, root.scene_id, c.candidate_id, v.name, aid)
+                        if agent_traj is None:
+                            if not generate_online:
+                                raise RuntimeError(
+                                    "Missing rollout_cache item and adapter.generate_online_rollouts=false. "
+                                    "Either enable online Waymax/WOMD IDM rollout or provide cache files."
+                                )
+                            agent_traj = _idm_reactive_rollout(neutral_ref, c.trajectory, v, dt=root.dt)
+                        n = min(len(c.trajectory), len(agent_traj), len(neutral_ref))
+                        inter_feat = _make_agent_interaction_features(c, neutral_ref[:n], agent_traj[:n], root.dt)
+                        obs = make_response_observation(
+                            root.scene_id, root.root_hash, c.candidate_id, aid, v.name,
+                            c.trajectory[:n], agent_traj[:n], neutral_ref[:n], inter_feat,
+                            pr.score, pr.confidence, dt=root.dt,
+                        )
+                        group.observations[(c.candidate_id, aid, v.name)] = obs
+                        all_obs.append(obs)
+                # dataclass is frozen; replace candidate metadata with preexec per-agent features.
+                object.__setattr__(c, "metadata", c_meta)
+            # Fill CW labels back into observations and group metadata for tensor collation.
+            from mfrp.data.label_extraction import coercion_witness_label
+            cw_labels: dict[tuple[str, str], Any] = {}
+            for c in candidates:
+                for aid in agents:
+                    lab = coercion_witness_label(all_obs, c.candidate_id, aid, root.root_hash, root.scene_id)
+                    cw_labels[(c.candidate_id, aid)] = lab
+                    for v in variants:
+                        key = (c.candidate_id, aid, v.name)
+                        obs = group.observations.get(key)
+                        if obs is not None:
+                            object.__setattr__(obs, "cw_soft_label", float(lab.soft_label))
+                            object.__setattr__(obs, "cw_confidence", float(lab.confidence))
+            group.metadata["cw_labels"] = {f"{k[0]}|{k[1]}": dataclasses.asdict(v) if dataclasses.is_dataclass(v) else str(v) for k, v in cw_labels.items()}
+            group.boundary_pairs = _boundary_pairs(group)
+            if not group.observations:
+                continue
+            count += 1
+            if tqdm is not None and max_scenarios is not None:
+                state_iter.set_postfix(written=count, target=max_scenarios)
+            yield group
