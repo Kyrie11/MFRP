@@ -600,4 +600,5 @@ def build_groups(*, womd_pattern: str, split: str, config: dict[str, Any], max_s
             count += 1
             if tqdm is not None and max_scenarios is not None:
                 state_iter.set_postfix(written=count, target=max_scenarios)
+                shard_iter.set_postfix(written=count, target=max_scenarios)
             yield group
