@@ -6,8 +6,10 @@ import hashlib
 import json
 import numpy as np
 
-BRANCHES = ("keep", "cede", "brake", "accelerate", "pass", "nonconflict")
+# Keep this as a list: several downstream configs/tests compare the exact public API.
+BRANCHES = ["keep", "cede", "brake", "accelerate", "pass", "nonconflict"]
 CEDING_BRANCHES = ("cede", "brake")
+BRANCH_INDEX = {b: i for i, b in enumerate(BRANCHES)}
 
 
 def stable_hash(payload: Mapping[str, Any] | str) -> str:
@@ -18,52 +20,182 @@ def stable_hash(payload: Mapping[str, Any] | str) -> str:
     return hashlib.sha256(raw).hexdigest()[:16]
 
 
+def root_scene_hash(scene_id: str, t0: int | float, ego_index: int = 0) -> str:
+    return stable_hash({"scene_id": scene_id, "t0": t0, "ego_index": ego_index})
+
+
+@dataclass(frozen=True)
+class AgentTrackTensor:
+    track_id: str
+    states: np.ndarray
+    mask: np.ndarray | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class RouteContext:
+    route_features: np.ndarray | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
 @dataclass(frozen=True)
 class RootScene:
     """Observed root scene only. Do not put future labels here."""
 
     scene_id: str
     t0: int | float
-    history: np.ndarray  # [N, H, state_dim]
-    history_mask: np.ndarray  # [N, H]
+    history: np.ndarray
+    history_mask: np.ndarray
     ego_index: int = 0
     map_features: np.ndarray | None = None
     traffic_controls: np.ndarray | None = None
     route_features: np.ndarray | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
+    dt: float = 0.1
+    current_time_index: int | None = None
+    agent_tracks: list[AgentTrackTensor] | None = None
+    route_context: RouteContext | None = None
 
     @property
     def root_hash(self) -> str:
-        safe = {"scene_id": self.scene_id, "t0": self.t0, "ego_index": self.ego_index}
-        return stable_hash(safe)
+        return root_scene_hash(self.scene_id, self.t0, self.ego_index)
+
+    def root_state(self) -> dict[str, Any]:
+        return {
+            "scene_id": self.scene_id,
+            "t0": self.t0,
+            "history": self.history,
+            "history_mask": self.history_mask,
+            "ego_index": self.ego_index,
+            "dt": self.dt,
+            "metadata": dict(self.metadata),
+        }
 
 
 @dataclass(frozen=True)
 class EgoCandidate:
     candidate_id: str
-    trajectory: np.ndarray  # [T, state_dim], ego frame at t0
-    features: np.ndarray  # deployment-safe a_i(u;s) base features, may be agent-independent
+    trajectory: np.ndarray
+    features: np.ndarray | None = None
     nominal_cost: float = 0.0
     valid: bool = True
     metadata: dict[str, Any] = field(default_factory=dict)
+    family: str | None = None
+
+    def __post_init__(self):
+        if self.features is None:
+            object.__setattr__(self, "features", np.zeros(20, dtype=np.float32))
 
 
 @dataclass(frozen=True)
+class BoundaryPair:
+    agent_id: str
+    candidate_a: str
+    candidate_b: str
+    distance: float
+
+
+@dataclass(frozen=True)
+class CandidateValidity:
+    valid: bool
+    reason: str = ""
+
+
+@dataclass(init=False, frozen=True)
 class ResponseObservation:
+    """One rollout observation for (root, candidate, agent, variant).
+
+    Supports both the compact current constructor:
+      ResponseObservation(candidate_id, agent_id, variant_id, branch_probs, ...)
+    and the legacy constructor used in older tests/adapters:
+      ResponseObservation(scene_id, root_hash, candidate_id, agent_id, variant_id,
+                          branch_probs, branch_hard, trajectory, ...)
+    """
+
     candidate_id: str
     agent_id: str
     variant_id: str
-    branch_probs: np.ndarray  # [6]
-    trajectory: np.ndarray  # [T, state_dim]
-    trajectory_mask: np.ndarray  # [T]
+    branch_probs: np.ndarray
+    trajectory: np.ndarray
+    trajectory_mask: np.ndarray
     burden: float
     safety_margin: float
     high_pressure: bool
-    cw_soft_label: float = 0.0
-    cw_confidence: float = 0.0
-    priority_score_preexec: float = 0.5
-    priority_confidence_preexec: float = 0.0
-    diagnostics: dict[str, Any] = field(default_factory=dict)
+    cw_soft_label: float
+    cw_confidence: float
+    priority_score_preexec: float
+    priority_confidence_preexec: float
+    diagnostics: dict[str, Any]
+    scene_id: str | None
+    root_hash: str | None
+    branch_hard: int
+    tau_agent_in: float | None
+
+    def __init__(self, *args, **kwargs):
+        scene_id = kwargs.pop("scene_id", None)
+        root_hash = kwargs.pop("root_hash", None)
+        branch_hard = kwargs.pop("branch_hard", None)
+        tau_agent_in = kwargs.pop("tau_agent_in", None)
+        diagnostics = kwargs.pop("diagnostics", {})
+
+        if len(args) >= 15:
+            # legacy positional form
+            scene_id, root_hash, candidate_id, agent_id, variant_id, branch_probs, branch_hard, trajectory, trajectory_mask, burden, safety_margin, tau_agent_in, high_pressure, priority_score_preexec, priority_confidence_preexec, *rest = args
+            cw_soft_label = kwargs.pop("cw_soft_label", rest[0] if len(rest) > 0 else 0.0)
+            cw_confidence = kwargs.pop("cw_confidence", rest[1] if len(rest) > 1 else 0.0)
+        elif len(args) >= 6:
+            candidate_id, agent_id, variant_id, branch_probs, trajectory, trajectory_mask, *rest = args
+            burden = kwargs.pop("burden", rest[0] if len(rest) > 0 else 0.0)
+            safety_margin = kwargs.pop("safety_margin", rest[1] if len(rest) > 1 else 0.0)
+            high_pressure = kwargs.pop("high_pressure", rest[2] if len(rest) > 2 else False)
+            cw_soft_label = kwargs.pop("cw_soft_label", rest[3] if len(rest) > 3 else 0.0)
+            cw_confidence = kwargs.pop("cw_confidence", rest[4] if len(rest) > 4 else 0.0)
+            priority_score_preexec = kwargs.pop("priority_score_preexec", rest[5] if len(rest) > 5 else 0.5)
+            priority_confidence_preexec = kwargs.pop("priority_confidence_preexec", rest[6] if len(rest) > 6 else 0.0)
+        else:
+            candidate_id = kwargs.pop("candidate_id")
+            agent_id = kwargs.pop("agent_id")
+            variant_id = kwargs.pop("variant_id")
+            branch_probs = kwargs.pop("branch_probs")
+            trajectory = kwargs.pop("trajectory")
+            trajectory_mask = kwargs.pop("trajectory_mask")
+            burden = kwargs.pop("burden")
+            safety_margin = kwargs.pop("safety_margin")
+            high_pressure = kwargs.pop("high_pressure")
+            cw_soft_label = kwargs.pop("cw_soft_label", 0.0)
+            cw_confidence = kwargs.pop("cw_confidence", 0.0)
+            priority_score_preexec = kwargs.pop("priority_score_preexec", 0.5)
+            priority_confidence_preexec = kwargs.pop("priority_confidence_preexec", 0.0)
+        if kwargs:
+            raise TypeError(f"Unexpected ResponseObservation kwargs: {sorted(kwargs)}")
+
+        bp = np.asarray(branch_probs, dtype=np.float32)
+        if bp.shape != (len(BRANCHES),):
+            bp = np.resize(bp.reshape(-1), len(BRANCHES)).astype(np.float32)
+        s = float(bp.sum())
+        bp = bp / s if np.isfinite(s) and s > 0 else np.ones(len(BRANCHES), dtype=np.float32) / len(BRANCHES)
+        if branch_hard is None or int(branch_hard) < 0:
+            branch_hard = int(np.argmax(bp))
+
+        object.__setattr__(self, "candidate_id", str(candidate_id))
+        object.__setattr__(self, "agent_id", str(agent_id))
+        object.__setattr__(self, "variant_id", str(variant_id))
+        object.__setattr__(self, "branch_probs", bp)
+        object.__setattr__(self, "trajectory", np.asarray(trajectory, dtype=np.float32))
+        object.__setattr__(self, "trajectory_mask", np.asarray(trajectory_mask, dtype=bool))
+        object.__setattr__(self, "burden", float(burden))
+        object.__setattr__(self, "safety_margin", float(safety_margin))
+        object.__setattr__(self, "high_pressure", bool(high_pressure))
+        object.__setattr__(self, "cw_soft_label", float(cw_soft_label))
+        object.__setattr__(self, "cw_confidence", float(cw_confidence))
+        object.__setattr__(self, "priority_score_preexec", float(priority_score_preexec))
+        object.__setattr__(self, "priority_confidence_preexec", float(priority_confidence_preexec))
+        object.__setattr__(self, "diagnostics", diagnostics or {})
+        object.__setattr__(self, "scene_id", scene_id)
+        object.__setattr__(self, "root_hash", root_hash)
+        object.__setattr__(self, "branch_hard", int(branch_hard))
+        object.__setattr__(self, "tau_agent_in", None if tau_agent_in is None else float(tau_agent_in))
+        self.validate()
 
     def validate(self) -> None:
         bp = np.asarray(self.branch_probs, dtype=np.float32)
@@ -87,7 +219,7 @@ class SameRootGroup:
     rollout_variants: list[str]
     observations: dict[tuple[str, str, str], ResponseObservation]
     metadata: dict[str, Any] = field(default_factory=dict)
-    boundary_pairs: list[tuple[str, str, str, float]] = field(default_factory=list)  # agent_id, cand_a, cand_b, distance
+    boundary_pairs: list[tuple[str, str, str, float] | BoundaryPair] = field(default_factory=list)
 
     def validate(self, *, require_support_query_split: bool = True, allow_debug: bool = False) -> None:
         if not self.candidates:

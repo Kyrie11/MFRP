@@ -1,0 +1,56 @@
+# Recommended complete MFRP run configuration.
+# Keep support/query intervention groups only for training/evaluation; deployment must use scene-only inputs.
+paths:
+  womd_pattern: "/path/to/womd/*.tfrecord"
+  rollout_cache: "/path/to/waymax_reactive_rollout_cache"
+  dataset_root: "outputs/datasets/mfrp_womd_waymax"
+  diagnostics_root: "outputs/diagnostics"
+  checkpoint: "outputs/checkpoints/mfrp_best.pt"
+  calibration: "outputs/calibration/split_calibration.json"
+  eval_report: "outputs/eval/mfrp_test.json"
+
+data:
+  config: "configs/data/mfrp_womd_waymax.yaml"
+  adapter: "examples.mfrp_waymax_adapter:build_groups"
+  splits:
+    train: {max_scenarios: 20000, shard_size: 8}
+    val:   {max_scenarios: 2000, shard_size: 8}
+    test:  {max_scenarios: 2000, shard_size: 8}
+  required_checks:
+    same_root_reset: true
+    reactive_rollout_not_log_playback: true
+    support_query_split_by_candidate: true
+    require_ceding_nonceding_diversity: true
+    require_preexec_priority: true
+
+model:
+  model_config: "configs/model/mfrp_full.yaml"
+  train_config: "configs/train/mfrp_train.yaml"
+  device: "cuda"
+  max_steps: 200000
+
+calibration:
+  beta: 0.10
+  alpha: 0.05
+  note: "candidate-level split residual calibration; selected-action calibration should be added when closed-loop validation rollouts are available."
+
+planner:
+  alpha: 0.05
+  nu_bar: 0.30
+  gamma_bar: 0.60
+  aggregation: "noisy_or"   # alternatives supported in code: max, sum
+  reject_reasons: [risk, uncertainty, boundary, coercion]
+
+experiments:
+  heldout_response: true
+  surface_geometry: true
+  false_safe_selection: true
+  closed_loop_waymax: true
+  ablations:
+    - no_support
+    - no_distillation
+    - no_geometry
+    - no_cw_ranking
+    - risk_only_selector
+    - aggregation_max
+    - aggregation_sum

@@ -11,9 +11,14 @@ class SplitCalibration:
     beta: float
     q_beta: float
     alpha: float = 0.05
+    selected_q_beta: float | None = None
 
     def apply(self, rho_hat):
         return np.minimum(1.0, np.asarray(rho_hat) + self.q_beta)
+
+    def apply_selected(self, rho_hat):
+        q = self.q_beta if self.selected_q_beta is None else self.selected_q_beta
+        return np.minimum(1.0, np.asarray(rho_hat) + q)
 
     def to_json(self, path: str | Path) -> None:
         Path(path).parent.mkdir(parents=True, exist_ok=True)
@@ -33,3 +38,11 @@ def fit_split_calibration(rho_hat: np.ndarray, violation_truth: np.ndarray, *, b
     residual = truth[mask].clip(0, 1) - rho_hat[mask].clip(0, 1)
     q = float(np.quantile(residual, 1.0 - beta, method="higher"))
     return SplitCalibration(beta=float(beta), q_beta=max(0.0, q), alpha=float(alpha))
+
+
+def apply_calibration(rho_hat: np.ndarray, calibration: SplitCalibration | dict | float) -> np.ndarray:
+    if isinstance(calibration, SplitCalibration):
+        return calibration.apply(rho_hat)
+    if isinstance(calibration, dict):
+        return np.minimum(1.0, np.asarray(rho_hat) + float(calibration.get("q_beta", 0.0)))
+    return np.minimum(1.0, np.asarray(rho_hat) + float(calibration))

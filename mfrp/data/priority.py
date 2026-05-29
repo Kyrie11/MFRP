@@ -1,38 +1,35 @@
 from __future__ import annotations
 
-import math
-from typing import Mapping, Any
+from dataclasses import dataclass
+import numpy as np
 
 
-def sigmoid(x: float) -> float:
-    return 1.0 / (1.0 + math.exp(-max(-50.0, min(50.0, x))))
+@dataclass(frozen=True)
+class PriorityScore:
+    score: float
+    confidence: float
+    diagnostics: dict
 
 
-def compute_priority_score_preexec(features: Mapping[str, Any]) -> tuple[float, float]:
-    """Deployment-safe priority score from pre-execution metadata only.
+def compute_preexec_priority(features: dict) -> PriorityScore:
+    """Deployment-safe priority estimate from pre-execution metadata only."""
+    if not features:
+        return PriorityScore(0.5, 0.25, {"reason": "missing_preexec_features"})
+    gap = features.get("entry_time_gap", features.get("gap", None))
+    ego_has_right_of_way = features.get("ego_has_right_of_way", None)
+    agent_has_right_of_way = features.get("agent_has_right_of_way", None)
+    score = 0.5
+    conf = 0.3
+    if gap is not None and np.isfinite(gap):
+        # Positive gap means agent is predicted to enter first -> agent priority, ego lower priority.
+        score = 1.0 / (1.0 + np.exp(float(gap)))
+        conf = max(conf, min(1.0, abs(float(gap)) / 2.0))
+    if ego_has_right_of_way is True:
+        score = max(score, 0.8); conf = max(conf, 0.8)
+    if agent_has_right_of_way is True:
+        score = min(score, 0.2); conf = max(conf, 0.8)
+    return PriorityScore(float(np.clip(score, 0, 1)), float(np.clip(conf, 0, 1)), {"source": "preexec"})
 
-    Missing metadata returns uncertain prior rather than falsely implying low ego priority.
-    """
-    known = 0
-    z = 0.0
-    for key, weight in (
-        ("ego_has_right_of_way", 1.4),
-        ("agent_has_yield_or_stop", 1.1),
-        ("ego_protected_lane", 0.9),
-        ("ego_route_aligned", 0.5),
-    ):
-        if key in features:
-            known += 1
-            z += weight * (1.0 if bool(features[key]) else -0.6)
-    for key, weight in (("agent_has_right_of_way", -1.4), ("ego_has_yield_or_stop", -1.1), ("agent_protected_lane", -0.9)):
-        if key in features:
-            known += 1
-            z += weight * (1.0 if bool(features[key]) else -0.6)
-    if "neutral_entry_gap" in features:
-        known += 1
-        gap = float(features["neutral_entry_gap"])
-        z += max(-2.0, min(2.0, gap)) * 0.35
-    if known == 0:
-        return 0.5, 0.0
-    confidence = min(1.0, known / 5.0)
-    return sigmoid(z), confidence
+
+def compute_priority_score(features: dict) -> PriorityScore:
+    return compute_preexec_priority(features)
