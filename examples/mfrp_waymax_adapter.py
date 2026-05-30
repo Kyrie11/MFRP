@@ -2,18 +2,17 @@
 
 The original bundle only accepted a precomputed ``config.adapter.rollout_cache``
 and raised at dataset-generation time.  This version keeps cache support, but
-also performs online same-root reactive rollouts from WOMD scenarios loaded by
-Waymax.  The online rollout is intentionally local and reproducible: the root
-scene comes from Waymax/WOMD, the ego candidate is forcibly injected, and each
-surrounding vehicle follows its logged Waymax/WOMD route with an IDM-style
-reactive speed update against the counterfactual ego trajectory.  Multiple IDM
-parameterizations provide the policy variants needed by the paper's ceding vs
-non-ceding evidence.
+builds same-root IDM-proxy reactive rollouts from WOMD scenarios loaded by
+Waymax.  Ego candidates are generated from the observed root state with
+kinematic primitives rather than from the logged SDC future.  Surrounding
+vehicles follow their WOMD route geometry with reactive IDM speed updates;
+burden is measured against a same-policy neutral-candidate rollout.
 
 The implementation does not use log playback as response supervision.  Logged
 future trajectories are used only as route geometry for the reactive agents,
 which is the same design assumption as Waymax's IDMRoutePolicy: follow the
-agent's logged route while updating speed reactively.
+agent's route while updating speed reactively.  This remains an IDM proxy, not
+a full Waymax closed-loop simulator.
 """
 from __future__ import annotations
 
@@ -22,6 +21,7 @@ import dataclasses
 from pathlib import Path
 from typing import Any, Iterator
 import glob
+import hashlib
 from tqdm.auto import tqdm
 import math
 import numpy as np
@@ -168,12 +168,58 @@ def _pack_states(arr: dict[str, np.ndarray], obj: int, sl: slice) -> np.ndarray:
     return np.stack([x, y, np.zeros_like(x), vx, vy, speed, yaw, length, width, valid], axis=-1).astype(np.float32)
 
 
+def _safe_numeric_flatten(x: Any, limit: int = 64) -> np.ndarray:
+    """Best-effort numeric flattener for optional Waymax metadata fields."""
+    if x is None or limit <= 0:
+        return np.zeros(0, dtype=np.float32)
+    try:
+        arr = _as_np(x)
+        if arr.dtype.kind in {"b", "i", "u", "f"}:
+            flat = arr.astype(np.float32).reshape(-1)
+            flat = flat[np.isfinite(flat)]
+            return flat[:limit]
+    except Exception:
+        pass
+    vals: list[np.ndarray] = []
+    for name in ("x", "y", "z", "state", "valid", "lane_id", "stop_point", "traffic_light_state", "ids", "id"):
+        try:
+            v = _maybe_get(x, name)
+        except Exception:
+            v = None
+        if v is not None:
+            vals.append(_safe_numeric_flatten(v, max(0, limit - sum(len(a) for a in vals))))
+        if sum(len(a) for a in vals) >= limit:
+            break
+    vals = [v for v in vals if len(v)]
+    return np.concatenate(vals, axis=0)[:limit] if vals else np.zeros(0, dtype=np.float32)
+
+
 def _extract_route_context(state: Any) -> RouteContext:
-    # Current schema only carries route_features.  Keep metadata compact and safe.
-    return RouteContext(route_features=None, metadata={"route_source": "waymax_womd_logged_route_geometry"})
+    # Route hypotheses, when available in the Waymax state, are root-scene inputs.
+    # If the field is absent, downstream priority receives low confidence instead
+    # of fabricating route priority from future logs.
+    route = None
+    for name in ("sdc_paths", "route", "routes", "route_paths", "paths"):
+        val = _safe_numeric_flatten(_maybe_get(state, name), limit=32)
+        if len(val):
+            route = val.astype(np.float32)
+            break
+    return RouteContext(route_features=route, metadata={"route_source": "waymax_root_route_metadata" if route is not None else "missing"})
 
 
-def _extract_map_summary(state: Any) -> np.ndarray | None:
+def _extract_traffic_controls_summary(state: Any) -> np.ndarray | None:
+    vals: list[np.ndarray] = []
+    for name in ("log_traffic_light", "traffic_lights", "traffic_light", "traffic_light_states", "dynamic_map_states"):
+        flat = _safe_numeric_flatten(_maybe_get(state, name), limit=32)
+        if len(flat):
+            vals.append(flat)
+    if not vals:
+        return None
+    flat = np.concatenate(vals, axis=0).astype(np.float32)
+    return flat[:32]
+
+
+def _extract_map_summary(state: Any, ego0_world: np.ndarray | None = None) -> np.ndarray | None:
     rg = _maybe_get(state, "roadgraph_points")
     if rg is None:
         return None
@@ -184,7 +230,12 @@ def _extract_map_summary(state: Any) -> np.ndarray | None:
         return None
     xy = np.stack([_as_np(x).reshape(-1), _as_np(y).reshape(-1)], axis=-1).astype(np.float32)
     if valid is not None:
-        xy = xy[_as_np(valid).reshape(-1).astype(bool)]
+        vm = _as_np(valid).reshape(-1).astype(bool)
+        if len(vm) == len(xy):
+            xy = xy[vm]
+    xy = xy[np.isfinite(xy).all(axis=-1)]
+    if ego0_world is not None and len(xy):
+        xy = _rot(xy - np.asarray(ego0_world[:2], dtype=np.float32), float(ego0_world[6]))
     return xy[:512]
 
 
@@ -204,20 +255,21 @@ def _make_root_scene(state: Any, split: str, idx: int, cfg: dict[str, Any]) -> t
     history_mask = arr["valid"][:, :hist].astype(bool)
     scene_id = _scenario_id(state, idx)
     split_norm = "val" if split in {"val", "mini"} else split if split in {"train", "test", "stress"} else "debug"
+    route_ctx = _extract_route_context(state)
     root = RootScene(
         scene_id=scene_id,
         t0=current,
         history=history,
         history_mask=history_mask,
         ego_index=ego,
-        map_features=_extract_map_summary(state),
-        traffic_controls=None,
-        route_features=None,
+        map_features=_extract_map_summary(state, ego0_world),
+        traffic_controls=_extract_traffic_controls_summary(state),
+        route_features=route_ctx.route_features,
         metadata={"source": "womd_waymax", "womd_version": str(data.get("womd_version", "")), "waymax_state_type": type(state).__name__},
         dt=0.1,
         current_time_index=current,
         agent_tracks=[AgentTrackTensor(str(int(arr["object_id"][i])), hist_ego[i], mask=history_mask[i], metadata={"object_type": str(int(arr["object_type"][i]))}) for i in range(N)],
-        route_context=_extract_route_context(state),
+        route_context=route_ctx,
     )
     return root, arr, ego0_world
 
@@ -254,61 +306,173 @@ def _candidate_features(states: np.ndarray, dt: float) -> np.ndarray:
     return feat
 
 
+def _candidate_feasibility(root: RootScene, states: np.ndarray, cfg: dict[str, Any]) -> tuple[bool, str]:
+    """Reject obviously invalid intervention primitives before training labels."""
+    data = cfg.get("dataset", {})
+    arr = np.asarray(states, dtype=np.float32)
+    if arr.ndim != 2 or arr.shape[0] == 0 or arr.shape[-1] < 6:
+        return False, "bad_shape"
+    valid = arr[:, 9] > 0.5 if arr.shape[-1] > 9 else np.isfinite(arr[:, :2]).all(axis=-1)
+    if not valid.any():
+        return False, "no_valid_steps"
+    if not np.isfinite(arr[valid, :6]).all():
+        return False, "nonfinite_state"
+    dt = float(root.dt)
+    speed = arr[:, 5]
+    acc = np.gradient(speed, dt) if len(speed) > 1 else np.zeros_like(speed)
+    jerk = np.gradient(acc, dt) if len(acc) > 1 else np.zeros_like(acc)
+    max_speed = float(data.get("max_candidate_speed_mps", 45.0))
+    max_acc = float(data.get("max_candidate_accel_mps2", 4.5))
+    max_dec = float(data.get("max_candidate_decel_mps2", 7.0))
+    max_jerk = float(data.get("max_candidate_jerk_mps3", 25.0))
+    if float(np.nanmax(speed[valid])) > max_speed:
+        return False, "speed_limit"
+    if float(np.nanmax(acc[valid])) > max_acc or float(np.nanmax(-acc[valid])) > max_dec:
+        return False, "accel_limit"
+    if float(np.nanmax(np.abs(jerk[valid]))) > max_jerk:
+        return False, "jerk_limit"
+    # Optional approximate map support: if local roadgraph exists, require the
+    # trajectory to remain near some roadgraph point.  This is not a substitute
+    # for Waymax offroad metrics but catches gross primitive failures.
+    road = getattr(root, "map_features", None)
+    if road is not None and len(road):
+        xy = arr[valid, :2]
+        pts = np.asarray(road, dtype=np.float32)[:, :2]
+        stride = max(1, len(pts) // 512)
+        pts = pts[::stride]
+        d2 = ((xy[:, None, :] - pts[None, :, :]) ** 2).sum(axis=-1)
+        max_offroad_proxy = float(data.get("max_candidate_roadgraph_distance_m", 25.0))
+        if float(np.sqrt(np.nanpercentile(np.nanmin(d2, axis=1), 90))) > max_offroad_proxy:
+            return False, "roadgraph_distance"
+    return True, "ok"
+
+
+def _current_rich_state(root: RootScene, track_index: int) -> np.ndarray:
+    tracks = root.agent_tracks or []
+    if 0 <= int(track_index) < len(tracks):
+        states = np.asarray(tracks[int(track_index)].states, dtype=np.float32)
+        mask = np.asarray(tracks[int(track_index)].mask if tracks[int(track_index)].mask is not None else np.ones(len(states)), dtype=bool)
+        if len(states) and mask.any():
+            return states[mask][-1].astype(np.float32)
+    # Fallback from compact history: [x,y,vx,vy,yaw].
+    h = np.asarray(root.history[int(track_index)], dtype=np.float32)
+    m = np.asarray(root.history_mask[int(track_index)], dtype=bool)
+    last = h[m][-1] if len(h) and m.any() else np.zeros(5, dtype=np.float32)
+    out = np.zeros(10, dtype=np.float32)
+    out[0], out[1] = last[0], last[1]
+    out[3], out[4] = last[2], last[3]
+    out[5] = float(np.hypot(out[3], out[4]))
+    out[6] = float(last[4]) if len(last) > 4 else 0.0
+    out[7], out[8], out[9] = 4.5, 2.0, 1.0
+    return out
+
+
+def _rollout_ego_primitive(root: RootScene, *, future_steps: int, speed_scale: float, delay_s: float, lateral_offset: float) -> np.ndarray:
+    """Observation-only kinematic ego candidate.
+
+    This intentionally does not read logged SDC future.  It rolls the ego from
+    the root state using simple longitudinal primitives, so speed/timing changes
+    move the position trajectory as well as velocity fields.
+    """
+    dt = float(root.dt)
+    cur = _current_rich_state(root, int(root.ego_index)).copy()
+    out = np.repeat(cur[None, :], int(future_steps), axis=0).astype(np.float32)
+    yaw0 = float(cur[6]) if len(cur) > 6 and np.isfinite(cur[6]) else 0.0
+    fwd = np.array([math.cos(yaw0), math.sin(yaw0)], dtype=np.float32)
+    normal = np.array([-math.sin(yaw0), math.cos(yaw0)], dtype=np.float32)
+    v0 = float(cur[5]) if len(cur) > 5 and np.isfinite(cur[5]) else float(np.hypot(cur[3], cur[4]))
+    target_v = max(0.0, v0 * float(speed_scale))
+    delay_steps = max(0, int(round(max(0.0, float(delay_s)) / dt)))
+    advance_boost = max(0.0, -float(delay_s))
+    accel_limit = 2.5
+    decel_limit = 4.0
+    x = np.array(cur[:2], dtype=np.float32)
+    v = max(0.0, v0)
+    for t in range(int(future_steps)):
+        if t < delay_steps:
+            desired = 0.0
+        else:
+            desired = target_v + min(2.0, advance_boost * 1.5)
+        dv = desired - v
+        a = float(np.clip(dv / max(dt, 1e-3), -decel_limit, accel_limit))
+        v = max(0.0, v + a * dt)
+        x = x + fwd * (v * dt)
+        # Smooth lateral commitment over the first 2 seconds.
+        frac = min(1.0, (t + 1) / max(1.0, 2.0 / dt))
+        pos = x + normal * (float(lateral_offset) * frac)
+        out[t, 0:2] = pos
+        out[t, 3:5] = fwd * v
+        out[t, 5] = v
+        out[t, 6] = yaw0
+        if out.shape[-1] > 9:
+            out[t, 9] = 1.0
+    return out.astype(np.float32)
+
+
 def _logged_future_candidate(root: RootScene, arr: dict[str, np.ndarray], ego0_world: np.ndarray, future_steps: int) -> EgoCandidate:
     ego = root.ego_index
     start = int(root.current_time_index or root.t0) + 1
     world = _future_world(arr, ego, start, future_steps)
     states = _to_ego_frame_states(world, ego0_world)
-    return EgoCandidate("logged", states, features=_candidate_features(states, root.dt), nominal_cost=0.0, valid=bool(states[:, 9].any()), metadata={"is_logged_anchor": True}, family="logged_anchor")
-
-
-def _shift_along_heading(states: np.ndarray, speed_scale: float, delay_steps: int, advance_steps: int, lateral_offset: float) -> np.ndarray:
-    s = np.asarray(states, dtype=np.float32).copy()
-    if delay_steps > 0:
-        s = np.concatenate([np.repeat(s[:1], delay_steps, axis=0), s[:-delay_steps]], axis=0)
-    if advance_steps > 0:
-        tail = np.repeat(s[-1:], advance_steps, axis=0)
-        # Constant-velocity extension for positive timing advances.
-        for k in range(advance_steps):
-            tail[k, 0] = s[-1, 0] + s[-1, 3] * 0.1 * (k + 1)
-            tail[k, 1] = s[-1, 1] + s[-1, 4] * 0.1 * (k + 1)
-        s = np.concatenate([s[advance_steps:], tail], axis=0)
-    s[:, 3:5] *= float(speed_scale)
-    s[:, 5] *= float(speed_scale)
-    if lateral_offset != 0.0:
-        yaw = s[:, 6]
-        normal = np.stack([-np.sin(yaw), np.cos(yaw)], axis=-1)
-        s[:, :2] += normal * float(lateral_offset)
-    return s
+    return EgoCandidate("logged", states, features=_candidate_features(states, root.dt), nominal_cost=0.0, valid=bool(states[:, 9].any()), metadata={"is_logged_anchor": True, "leakage_risk": "logged_future_anchor"}, family="logged_anchor")
 
 
 def _perturb_candidate(base: EgoCandidate, cid: str, speed_scale: float, delay_s: float, lateral_offset: float, cost: float, dt: float) -> EgoCandidate:
-    raw = np.asarray(base.trajectory, dtype=np.float32)
-    delay_steps = max(0, int(round(delay_s / dt)))
-    advance_steps = max(0, int(round(-delay_s / dt)))
-    states = _shift_along_heading(raw, speed_scale, delay_steps, advance_steps, lateral_offset)
-    return EgoCandidate(cid, states, features=_candidate_features(states, dt), nominal_cost=float(cost), valid=bool(states[:, 9].any()), metadata={"speed_scale": speed_scale, "delay_s": delay_s, "lateral_offset": lateral_offset}, family="timing_assertiveness_perturbation")
+    # Kept for backwards compatibility with tests/imports; now physically re-integrates
+    # from the first state instead of only scaling velocity channels.
+    root_like = type("_RootLike", (), {})()
+    object.__setattr__(root_like, "dt", dt)
+    object.__setattr__(root_like, "ego_index", 0)
+    object.__setattr__(root_like, "agent_tracks", [AgentTrackTensor("ego", np.asarray(base.trajectory[:1], dtype=np.float32), mask=np.ones(1, dtype=bool))])
+    object.__setattr__(root_like, "history", np.asarray(base.trajectory[:1, [0,1,3,4,6]], dtype=np.float32)[None])
+    object.__setattr__(root_like, "history_mask", np.ones((1,1), dtype=bool))
+    states = _rollout_ego_primitive(root_like, future_steps=len(base.trajectory), speed_scale=speed_scale, delay_s=delay_s, lateral_offset=lateral_offset)
+    feasible, reason = _candidate_feasibility(root_like, states, {"dataset": {}})
+    return EgoCandidate(cid, states, features=_candidate_features(states, dt), nominal_cost=float(cost), valid=bool(feasible), metadata={"speed_scale": speed_scale, "delay_s": delay_s, "lateral_offset": lateral_offset, "candidate_source": "observed_root_kinematic", "feasibility_reason": reason, "agent_feature_offset": 8}, family="timing_assertiveness_primitive")
 
 
 def _generate_candidates(root: RootScene, arr: dict[str, np.ndarray], ego0_world: np.ndarray, cfg: dict[str, Any]) -> list[EgoCandidate]:
     data = cfg.get("dataset", {})
     future_steps = int(data.get("future_steps", cfg.get("tensor", {}).get("future_steps", 80)))
-    base = _logged_future_candidate(root, arr, ego0_world, future_steps)
-    candidates = [base]
-    speed_scales = data.get("speed_scales", [0.75, 0.9, 1.0, 1.1, 1.25])
-    delays = data.get("timing_delays_s", [-0.4, -0.2, 0.0, 0.2, 0.4, 0.8])
-    lateral_offsets = data.get("lateral_offsets_m", [0.0])
+    speed_scales = [float(x) for x in data.get("speed_scales", [0.75, 0.9, 1.0, 1.1, 1.25])]
+    delays = [float(x) for x in data.get("timing_delays_s", [-0.4, -0.2, 0.0, 0.2, 0.4, 0.8])]
+    lateral_offsets = [float(x) for x in data.get("lateral_offsets_m", [-0.5, 0.0, 0.5])]
     max_k = int(data.get("candidates_per_group", 24))
+    candidates: list[EgoCandidate] = []
+    if bool(data.get("allow_logged_future_anchor", False)):
+        candidates.append(_logged_future_candidate(root, arr, ego0_world, future_steps))
+    # Stratified order: include neutral and each family before truncation.
+    combos = [(1.0, 0.0, 0.0)]
     for ss in speed_scales:
         for ds in delays:
             for lo in lateral_offsets:
-                if len(candidates) >= max_k:
-                    return candidates
-                if abs(float(ss) - 1.0) < 1e-6 and abs(float(ds)) < 1e-6 and abs(float(lo)) < 1e-6:
-                    continue
-                cid = f"cand_v{float(ss):.2f}_d{float(ds):+.1f}_l{float(lo):+.1f}"
-                cost = abs(float(ss) - 1.0) + 0.15 * abs(float(ds)) + 0.05 * abs(float(lo))
-                candidates.append(_perturb_candidate(base, cid, float(ss), float(ds), float(lo), cost, root.dt))
+                c = (ss, ds, lo)
+                if c not in combos:
+                    combos.append(c)
+    for ss, ds, lo in combos:
+        if len(candidates) >= max_k:
+            break
+        cid = "neutral" if abs(ss - 1.0) < 1e-6 and abs(ds) < 1e-6 and abs(lo) < 1e-6 else f"cand_v{ss:.2f}_d{ds:+.1f}_l{lo:+.1f}"
+        states = _rollout_ego_primitive(root, future_steps=future_steps, speed_scale=ss, delay_s=ds, lateral_offset=lo)
+        cost = abs(ss - 1.0) + 0.15 * abs(ds) + 0.05 * abs(lo)
+        feasible, reason = _candidate_feasibility(root, states, cfg)
+        candidates.append(EgoCandidate(
+            cid,
+            states,
+            features=_candidate_features(states, root.dt),
+            nominal_cost=float(cost),
+            valid=bool(feasible),
+            metadata={
+                "speed_scale": ss,
+                "delay_s": ds,
+                "lateral_offset": lo,
+                "candidate_source": "observed_root_kinematic",
+                "uses_logged_future": False,
+                "feasibility_reason": reason,
+                "agent_feature_offset": 8,
+            },
+            family="neutral" if cid == "neutral" else "timing_assertiveness_primitive",
+        ))
     return candidates
 
 
@@ -334,7 +498,24 @@ def _support_query_split(candidates: list[EgoCandidate], cfg: dict[str, Any]) ->
         raise RuntimeError("Need at least two candidates for support/query split")
     qf = float(cfg.get("dataset", {}).get("query_fraction", 0.35))
     qn = max(1, int(round(len(ids) * qf)))
-    query = ids[-qn:]
+    # Deterministic stratified split over candidate families/metadata instead of taking
+    # the list tail, which biased query toward aggressive candidates.
+    buckets: dict[str, list[str]] = {}
+    for c in candidates:
+        meta = c.metadata or {}
+        key = f"v{meta.get('speed_scale', 1.0)}|l{meta.get('lateral_offset', 0.0)}"
+        buckets.setdefault(key, []).append(c.candidate_id)
+    query: list[str] = []
+    for bucket in buckets.values():
+        if len(query) < qn and len(bucket) > 1:
+            query.append(bucket[-1])
+    for cid in ids:
+        if len(query) >= qn:
+            break
+        if cid not in query and cid != "neutral":
+            query.append(cid)
+    if not query:
+        query = [ids[-1]]
     support = [x for x in ids if x not in set(query)]
     if not support:
         support, query = ids[:1], ids[1:]
@@ -423,6 +604,53 @@ def _idm_reactive_rollout(agent_base: np.ndarray, ego_traj: np.ndarray, variant:
     return out.astype(np.float32)
 
 
+def _agent_object_type(root: RootScene, agent_id: str) -> str:
+    try:
+        idx = int(agent_id)
+    except Exception:
+        return "unknown"
+    tracks = root.agent_tracks or []
+    if 0 <= idx < len(tracks):
+        return str(tracks[idx].metadata.get("object_type", "unknown")).lower()
+    return "unknown"
+
+
+def _is_vehicle_object_type(obj_type: str) -> bool:
+    # WOMD commonly encodes vehicle as 1; accept textual metadata as well.
+    t = str(obj_type).lower()
+    return t in {"1", "vehicle", "veh", "car", "truck", "bus"}
+
+
+def _observed_constant_velocity_agent(root: RootScene, agent_id: str, future_steps: int) -> np.ndarray:
+    try:
+        idx = int(agent_id)
+    except Exception:
+        idx = -1
+    tracks = root.agent_tracks or []
+    if 0 <= idx < len(tracks):
+        return constant_velocity_extrapolate(tracks[idx].states, future_steps, root.dt).astype(np.float32)
+    if 0 <= idx < root.history.shape[0]:
+        return constant_velocity_extrapolate(root.history[idx], future_steps, root.dt).astype(np.float32)
+    return np.zeros((future_steps, 10), dtype=np.float32)
+
+
+def _reactive_rollout_for_agent(root: RootScene, agent_id: str, route_ref: np.ndarray, ego_traj: np.ndarray, variant: VariantSpec) -> np.ndarray:
+    """Dispatch response model by agent class.
+
+    Vehicle-like tracks use the IDM route-following proxy.  Pedestrians, cyclists
+    and unknown classes use observed-history constant-velocity extrapolation rather
+    than a vehicle IDM model, which avoids training false vehicle-braking labels on
+    non-vehicle actors.
+    """
+    obj_type = _agent_object_type(root, agent_id)
+    if not _is_vehicle_object_type(obj_type):
+        out = _observed_constant_velocity_agent(root, agent_id, min(len(route_ref), len(ego_traj)))
+        if out.shape[-1] > 9:
+            out[:, 9] = 1.0
+        return out.astype(np.float32)
+    return _idm_reactive_rollout(route_ref, ego_traj, variant, dt=root.dt)
+
+
 def _agent_neutral_future(root: RootScene, arr: dict[str, np.ndarray], ego0_world: np.ndarray, agent_id: str, future_steps: int) -> np.ndarray:
     idx = int(agent_id)
     start = int(root.current_time_index or root.t0) + 1
@@ -440,34 +668,80 @@ def _make_agent_interaction_features(cand: EgoCandidate, neutral_ref: np.ndarray
     feat = dict(base_inter.features)
     feat.update({
         "tau_i0_in": base_inter.tau_agent_in,
-        "tau_i0_out": base_inter.tau_agent_in,
+        "tau_i0_out": base_inter.features.get("tau_i0_out", base_inter.tau_agent_in),
         "tau_i_k_in": resp_inter.tau_agent_in,
-        "tau_i_k_out": resp_inter.tau_agent_in,
+        "tau_i_k_out": resp_inter.features.get("tau_i0_out", resp_inter.tau_agent_in),
         "tau_ego_in": resp_inter.tau_ego_in,
-        "entry_time_gap": base_inter.tau_agent_in - base_inter.tau_ego_in if np.isfinite(base_inter.tau_agent_in) and np.isfinite(base_inter.tau_ego_in) else 0.0,
+        "entry_time_gap": resp_inter.tau_agent_in - resp_inter.tau_ego_in if np.isfinite(resp_inter.tau_agent_in) and np.isfinite(resp_inter.tau_ego_in) else 0.0,
         "min_distance": resp_inter.min_distance,
     })
     return feat
 
 
+def _preexec_agent_reference(root: RootScene, agent_id: str, future_steps: int) -> np.ndarray:
+    # Deployment-safe extrapolation from observed history only.  This is used for
+    # priority/features, not as a response label.
+    idx = int(agent_id)
+    tracks = root.agent_tracks or []
+    if 0 <= idx < len(tracks):
+        return constant_velocity_extrapolate(tracks[idx].states, future_steps, root.dt).astype(np.float32)
+    return constant_velocity_extrapolate(root.history[idx], future_steps, root.dt).astype(np.float32)
+
+
+def _candidate_param_vector(cand: EgoCandidate) -> np.ndarray:
+    meta = cand.metadata or {}
+    return np.array([
+        float(meta.get("speed_scale", 1.0)),
+        float(meta.get("delay_s", 0.0)),
+        float(meta.get("lateral_offset", 0.0)),
+    ], dtype=np.float32)
+
+
+def _observation_response_distance(obs_a: list[Any], obs_b: list[Any]) -> float:
+    if not obs_a or not obs_b:
+        return 1e-3
+    pa = np.mean([o.branch_probs for o in obs_a], axis=0)
+    pb = np.mean([o.branch_probs for o in obs_b], axis=0)
+    ba = float(np.mean([o.burden for o in obs_a])); bb = float(np.mean([o.burden for o in obs_b]))
+    ha = float(np.mean([o.safety_margin for o in obs_a])); hb = float(np.mean([o.safety_margin for o in obs_b]))
+    tv = 0.5 * float(np.abs(pa - pb).sum())
+    return max(tv + 0.25 * abs(ba - bb) + 0.25 * abs(ha - hb), 1e-3)
+
+
 def _boundary_pairs(group: SameRootGroup) -> list[BoundaryPair]:
+    """Build local/global intervention edges for response-surface geometry loss."""
     pairs: list[BoundaryPair] = []
     cands = group.candidates
+    if len(cands) < 2:
+        return pairs
+    params = np.stack([_candidate_param_vector(c) for c in cands], axis=0)
+    # Normalize rough units: speed scale, seconds, and meters should have similar influence.
+    scale = np.array([0.25, 0.4, 0.5], dtype=np.float32)
+    dmat = np.linalg.norm((params[:, None, :] - params[None, :, :]) / scale[None, None, :], axis=-1)
+    max_pairs_per_agent = int(group.metadata.get("max_boundary_pairs_per_agent", 48))
     for aid in group.relevant_agent_ids:
-        for k in range(len(cands) - 1):
-            obs_a = [o for key, o in group.observations.items() if key[0] == cands[k].candidate_id and key[1] == aid]
-            obs_b = [o for key, o in group.observations.items() if key[0] == cands[k + 1].candidate_id and key[1] == aid]
+        chosen: list[tuple[float, int, int]] = []
+        for i in range(len(cands)):
+            for j in range(i + 1, len(cands)):
+                chosen.append((float(dmat[i, j]), i, j))
+        chosen.sort(key=lambda x: x[0])
+        # Keep local pairs plus a small set of global pairs that cross timing/order changes.
+        local = chosen[: max_pairs_per_agent // 2]
+        global_pairs = chosen[-max(1, max_pairs_per_agent - len(local)) :] if len(chosen) > len(local) else []
+        seen: set[tuple[int, int]] = set()
+        for _, i, j in local + global_pairs:
+            if (i, j) in seen:
+                continue
+            seen.add((i, j))
+            obs_a = [o for key, o in group.observations.items() if key[0] == cands[i].candidate_id and key[1] == aid]
+            obs_b = [o for key, o in group.observations.items() if key[0] == cands[j].candidate_id and key[1] == aid]
             if not obs_a or not obs_b:
                 continue
-            pa = np.mean([o.branch_probs for o in obs_a], axis=0)
-            pb = np.mean([o.branch_probs for o in obs_b], axis=0)
-            ba = float(np.mean([o.burden for o in obs_a])); bb = float(np.mean([o.burden for o in obs_b]))
-            ha = float(np.mean([o.safety_margin for o in obs_a])); hb = float(np.mean([o.safety_margin for o in obs_b]))
-            tv = 0.5 * float(np.abs(pa - pb).sum())
-            dist = tv + 0.25 * abs(ba - bb) + 0.25 * abs(ha - hb)
-            pairs.append(BoundaryPair(aid, cands[k].candidate_id, cands[k + 1].candidate_id, max(dist, 1e-3)))
+            dist = _observation_response_distance(obs_a, obs_b)
+            pairs.append(BoundaryPair(aid, cands[i].candidate_id, cands[j].candidate_id, dist))
+            if len([p for p in pairs if p.agent_id == aid]) >= max_pairs_per_agent:
+                break
     return pairs
-
 
 def _parse_variants(adapter_cfg: dict[str, Any]) -> list[VariantSpec]:
     raw = adapter_cfg.get("variants") or adapter_cfg.get("policy_variants") or []
@@ -482,6 +756,18 @@ def _parse_variants(adapter_cfg: dict[str, Any]) -> list[VariantSpec]:
             name = str(v)
             out.append(default_by_name.get(name, VariantSpec(name)))
     return out
+
+
+def _include_in_requested_split(scene_id: str, split: str) -> bool:
+    # Allows val/test to share the official WOMD validation directory without
+    # leaking identical root scenes across evaluation roles.
+    split = str(split).lower()
+    if split not in {"val", "test", "calib", "calibration"}:
+        return True
+    h = int(hashlib.sha256(scene_id.encode("utf-8")).hexdigest()[:8], 16) % 10
+    if split in {"val", "calib", "calibration"}:
+        return h < 5
+    return h >= 5
 
 
 def build_groups(*, womd_pattern: str, split: str, config: dict[str, Any], max_scenarios: int | None = None, num_workers: int = 1) -> Iterator[SameRootGroup]:
@@ -529,6 +815,8 @@ def build_groups(*, womd_pattern: str, split: str, config: dict[str, Any], max_s
             idx = global_idx
             global_idx += 1
             root, arr, ego0_world = _make_root_scene(state, split, idx, config)
+            if not _include_in_requested_split(root.scene_id, split):
+                continue
             candidates = _generate_candidates(root, arr, ego0_world, config)
             agents = _select_relevant_agents(root, config)
             if not agents or len(candidates) < 2:
@@ -544,36 +832,53 @@ def build_groups(*, womd_pattern: str, split: str, config: dict[str, Any], max_s
                     "support_candidate_ids": support,
                     "query_candidate_ids": query,
                     "uses_log_playback_for_response": False,
-                    "reactive_rollout_backend": "waymax_womd_route_idm_online" if generate_online else "cache",
+                    "reactive_rollout_backend": "womd_route_idm_proxy_same_root" if generate_online else "cache",
+                    "candidate_generator": "observed_root_kinematic_primitives",
+                    "neutral_baseline": "same_variant_neutral_candidate_rollout",
                     "adapter": "examples.mfrp_waymax_adapter",
+                    "max_boundary_pairs_per_agent": int(data_cfg.get("max_boundary_pairs_per_agent", 48)),
                 },
             )
             all_obs = []
+            neutral_candidate = next((cand for cand in candidates if cand.candidate_id == "neutral"), candidates[0])
+            # Per (agent, variant) route references and same-policy neutral baselines.
+            route_refs: dict[str, np.ndarray] = {}
+            preexec_refs: dict[str, np.ndarray] = {}
+            neutral_baselines: dict[tuple[str, str], np.ndarray] = {}
+            for aid in agents:
+                route_refs[aid] = _agent_neutral_future(root, arr, ego0_world, aid, future_steps)
+                preexec_refs[aid] = _preexec_agent_reference(root, aid, future_steps)
+                for v in variants:
+                    neutral_baselines[(aid, v.name)] = _reactive_rollout_for_agent(root, aid, route_refs[aid], neutral_candidate.trajectory, v)
             for c in candidates:
                 c_meta = dict(c.metadata)
                 c_meta.setdefault("agent_features", {})
                 for aid in agents:
-                    neutral_ref = _agent_neutral_future(root, arr, ego0_world, aid, future_steps)
-                    pre_feat = _make_agent_interaction_features(c, neutral_ref, neutral_ref, root.dt)
+                    preexec_ref = preexec_refs[aid]
+                    pre_feat = _make_agent_interaction_features(c, preexec_ref, preexec_ref, root.dt)
+                    pre_feat["has_route_context"] = root.route_features is not None or (root.route_context is not None and root.route_context.route_features is not None)
+                    pre_feat["has_traffic_controls"] = root.traffic_controls is not None
                     pr = compute_priority_score(pre_feat)
                     c_meta["agent_features"][aid] = {"interaction_features": np.array([
                         pre_feat.get("tau_ego_in", 0.0), pre_feat.get("tau_i0_in", 0.0), pre_feat.get("entry_time_gap", 0.0),
                         pre_feat.get("min_distance", 0.0), pr.score, pr.confidence,
-                    ], dtype=np.float32)}
+                    ], dtype=np.float32), "priority_source": "observed_history_constant_velocity"}
                     for v in variants:
+                        route_ref = route_refs[aid]
+                        baseline_traj = neutral_baselines[(aid, v.name)]
                         agent_traj = _load_cached_rollout(rollout_cache, root.scene_id, c.candidate_id, v.name, aid)
                         if agent_traj is None:
                             if not generate_online:
                                 raise RuntimeError(
                                     "Missing rollout_cache item and adapter.generate_online_rollouts=false. "
-                                    "Either enable online Waymax/WOMD IDM rollout or provide cache files."
+                                    "Either enable online WOMD-route IDM rollout or provide cache files."
                                 )
-                            agent_traj = _idm_reactive_rollout(neutral_ref, c.trajectory, v, dt=root.dt)
-                        n = min(len(c.trajectory), len(agent_traj), len(neutral_ref))
-                        inter_feat = _make_agent_interaction_features(c, neutral_ref[:n], agent_traj[:n], root.dt)
+                            agent_traj = baseline_traj if c.candidate_id == neutral_candidate.candidate_id else _reactive_rollout_for_agent(root, aid, route_ref, c.trajectory, v)
+                        n = min(len(c.trajectory), len(agent_traj), len(baseline_traj))
+                        inter_feat = _make_agent_interaction_features(c, baseline_traj[:n], agent_traj[:n], root.dt)
                         obs = make_response_observation(
                             root.scene_id, root.root_hash, c.candidate_id, aid, v.name,
-                            c.trajectory[:n], agent_traj[:n], neutral_ref[:n], inter_feat,
+                            c.trajectory[:n], agent_traj[:n], baseline_traj[:n], inter_feat,
                             pr.score, pr.confidence, dt=root.dt,
                         )
                         group.observations[(c.candidate_id, aid, v.name)] = obs

@@ -10,6 +10,7 @@ import numpy as np
 BRANCHES = ["keep", "cede", "brake", "accelerate", "pass", "nonconflict"]
 CEDING_BRANCHES = ("cede", "brake")
 BRANCH_INDEX = {b: i for i, b in enumerate(BRANCHES)}
+TRAJ_TARGET_DIM = 5
 
 
 def stable_hash(payload: Mapping[str, Any] | str) -> str:

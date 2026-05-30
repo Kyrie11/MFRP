@@ -32,7 +32,8 @@ model:
 calibration:
   beta: 0.10
   alpha: 0.05
-  note: "candidate-level split residual calibration; selected-action calibration should be added when closed-loop validation rollouts are available."
+  selected_action: true
+  note: "candidate-level residual calibration plus selector-level residual calibration when --selected-action is used; full closed-loop guarantees still require held-out simulator validation."
 
 planner:
   alpha: 0.05

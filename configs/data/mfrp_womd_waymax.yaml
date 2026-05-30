@@ -17,7 +17,7 @@ planning:
   alpha: 0.05
   beta_calibration: 0.1
   nu_bar: 0.3
-  gamma_bar: 2.0
+  gamma_bar: 0.60
 
 adapter:
   generate_online_rollouts: true
@@ -37,4 +37,10 @@ dataset:
   query_fraction: 0.35
   speed_scales: [0.75, 0.9, 1.0, 1.1, 1.25]
   timing_delays_s: [-0.4, -0.2, 0.0, 0.2, 0.4, 0.8]
-  lateral_offsets_m: [0.0]
+  lateral_offsets_m: [-0.5, 0.0, 0.5]
+  max_candidate_speed_mps: 45.0
+  max_candidate_accel_mps2: 4.5
+  max_candidate_decel_mps2: 7.0
+  max_candidate_jerk_mps3: 25.0
+  max_candidate_roadgraph_distance_m: 25.0
+  max_boundary_pairs_per_agent: 48

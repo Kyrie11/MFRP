@@ -1,4 +1,4 @@
 metrics: [prediction, false_safe, boundary, calibration]
 alpha: 0.05
 nu_bar: 0.3
-gamma_bar: 2.0
+gamma_bar: 0.60

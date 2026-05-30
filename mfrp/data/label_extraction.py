@@ -19,16 +19,54 @@ def softmax_scores(scores: dict[str, float], temperature: float = 1.0) -> np.nda
     return p / p.sum()
 
 
-def _speed(traj: np.ndarray, dt: float) -> np.ndarray:
+def _valid_mask(traj: np.ndarray) -> np.ndarray:
     traj = np.asarray(traj, dtype=np.float32)
     if traj.ndim == 1:
         traj = traj[None]
     if traj.shape[-1] > 9:
-        return traj[:, 9]
-    if traj.shape[-1] > 3:
-        return traj[:, 3]
-    return np.linalg.norm(finite_difference(traj[:, :2], dt), axis=-1)
+        mask = traj[:, 9] > 0.5
+    else:
+        mask = np.isfinite(traj[:, :2]).all(axis=-1)
+    return mask & np.isfinite(traj[:, :2]).all(axis=-1)
 
+
+def _speed(traj: np.ndarray, dt: float) -> np.ndarray:
+    """Return physical speed, never the valid-mask channel.
+
+    Packed adapter states are [x,y,0,vx,vy,speed,yaw,length,width,valid].
+    Older code used column 9 and therefore treated valid=True as speed=1 m/s.
+    Invalid timesteps are set to NaN so downstream nan-aware reductions ignore
+    censored/padded future states.
+    """
+    traj = np.asarray(traj, dtype=np.float32)
+    if traj.ndim == 1:
+        traj = traj[None]
+    if traj.shape[-1] >= 6:
+        sp = traj[:, 5].astype(np.float32).copy()
+    elif traj.shape[-1] >= 5:
+        sp = np.linalg.norm(traj[:, 3:5], axis=-1).astype(np.float32)
+    elif traj.shape[-1] > 3:
+        sp = traj[:, 3].astype(np.float32).copy()
+    else:
+        sp = np.linalg.norm(finite_difference(traj[:, :2], dt), axis=-1).astype(np.float32)
+    mask = _valid_mask(traj)
+    sp[~mask] = np.nan
+    return sp
+
+
+
+
+def _nan_finite_difference(x: np.ndarray, dt: float) -> np.ndarray:
+    x = np.asarray(x, dtype=np.float32).reshape(-1)
+    valid = np.isfinite(x)
+    if len(x) < 2 or valid.sum() < 2:
+        return np.zeros_like(x, dtype=np.float32)
+    filled = x.copy()
+    idx = np.arange(len(x))
+    filled[~valid] = np.interp(idx[~valid], idx[valid], x[valid])
+    out = finite_difference(filled[:, None], dt).reshape(-1)
+    out[~valid] = np.nan
+    return out
 
 def classify_response_branch(
     *,
@@ -42,11 +80,12 @@ def classify_response_branch(
     nonconflict_distance: float = 12.0,
 ) -> np.ndarray:
     speed = _speed(agent_traj, dt)
-    acc = finite_difference(speed[:, None], dt).reshape(-1)
+    acc = _nan_finite_difference(speed, dt)
     max_brake = float(np.nanmax(-acc)) if acc.size else 0.0
     max_accel = float(np.nanmax(acc)) if acc.size else 0.0
     n = min(len(agent_traj), len(baseline_agent_traj))
-    ade = float(np.nanmean(np.linalg.norm(agent_traj[:n, :2] - baseline_agent_traj[:n, :2], axis=-1))) if n else 0.0
+    valid_pair = _valid_mask(agent_traj[:n]) & _valid_mask(baseline_agent_traj[:n]) if n else np.zeros(0, dtype=bool)
+    ade = float(np.nanmean(np.linalg.norm(agent_traj[:n, :2][valid_pair] - baseline_agent_traj[:n, :2][valid_pair], axis=-1))) if valid_pair.any() else 0.0
     m = min(len(ego_traj), len(agent_traj))
     min_dist = float(np.nanmin(np.linalg.norm(ego_traj[:m, :2] - agent_traj[:m, :2], axis=-1))) if m else float("inf")
     if min_dist > nonconflict_distance:
@@ -75,15 +114,16 @@ def compute_burden(
     scales = {**{"delay": 1.0, "dec": 2.0, "jerk": 2.0, "dev": 3.0}, **(scales or {})}
     speed = _speed(agent_traj, dt)
     bspeed = _speed(baseline_agent_traj, dt)
-    acc = finite_difference(speed[:, None], dt).reshape(-1)
-    bacc = finite_difference(bspeed[:, None], dt).reshape(-1)
-    jerk = finite_difference(acc[:, None], dt).reshape(-1)
-    bjerk = finite_difference(bacc[:, None], dt).reshape(-1)
+    acc = _nan_finite_difference(speed, dt)
+    bacc = _nan_finite_difference(bspeed, dt)
+    jerk = _nan_finite_difference(acc, dt)
+    bjerk = _nan_finite_difference(bacc, dt)
     n = min(len(agent_traj), len(baseline_agent_traj))
     delay = max(0.0, float(tau_agent_in - tau_agent_base_in)) / scales["delay"] if np.isfinite(tau_agent_in) and np.isfinite(tau_agent_base_in) else 0.0
     dec = max(0.0, float(np.nanmax(-acc) - np.nanmax(-bacc))) / scales["dec"] if acc.size and bacc.size else 0.0
     jr = max(0.0, float(np.sqrt(np.nanmean(jerk**2)) - np.sqrt(np.nanmean(bjerk**2)))) / scales["jerk"] if jerk.size and bjerk.size else 0.0
-    dev = float(np.nanmean(np.linalg.norm(agent_traj[:n, :2] - baseline_agent_traj[:n, :2], axis=-1))) / scales["dev"] if n else 0.0
+    valid_pair = _valid_mask(agent_traj[:n]) & _valid_mask(baseline_agent_traj[:n]) if n else np.zeros(0, dtype=bool)
+    dev = float(np.nanmean(np.linalg.norm(agent_traj[:n, :2][valid_pair] - baseline_agent_traj[:n, :2][valid_pair], axis=-1))) / scales["dev"] if valid_pair.any() else 0.0
     return float(delay + dec + 0.5 * jr + 0.5 * dev)
 
 
@@ -132,15 +172,18 @@ def signed_oriented_box_separation(a: np.ndarray, b: np.ndarray) -> float:
 
 def high_pressure_label(burden: float, agent_traj: np.ndarray, *, dt: float = 0.1, eta_b: float = 1.0, hard_brake: float = 4.0, hard_jerk: float = 5.0) -> bool:
     speed = _speed(agent_traj, dt)
-    acc = finite_difference(speed[:, None], dt).reshape(-1)
-    jerk = finite_difference(acc[:, None], dt).reshape(-1)
+    acc = _nan_finite_difference(speed, dt)
+    jerk = _nan_finite_difference(acc, dt)
     return bool(burden >= eta_b or (acc.size and np.nanmax(-acc) >= hard_brake) or (jerk.size and np.sqrt(np.nanmean(jerk**2)) >= hard_jerk))
 
 
 def safety_margin(ego_traj: np.ndarray, agent_traj: np.ndarray, *, ego_radius: float = 2.2, agent_radius: float = 2.2) -> float:
     if ego_traj.shape[-1] >= 9 and agent_traj.shape[-1] >= 9:
         n = min(len(ego_traj), len(agent_traj))
-        return float(np.nanmin([signed_oriented_box_separation(ego_traj[i], agent_traj[i]) for i in range(n)])) if n else float("nan")
+        
+        mask = _valid_mask(ego_traj[:n]) & _valid_mask(agent_traj[:n])
+        vals = [signed_oriented_box_separation(ego_traj[i], agent_traj[i]) for i in range(n) if mask[i]]
+        return float(np.nanmin(vals)) if vals else float("nan")
     return signed_point_margin(ego_traj, agent_traj, ego_radius, agent_radius)
 
 
@@ -173,6 +216,8 @@ def coercion_witness_label(
     pnc = 1.0 - pc
     safe = np.array([1.0 if o.safety_margin > 0 else 0.0 for o in obs], dtype=np.float32)
     burden = np.array([max(0.0, float(o.burden)) for o in obs], dtype=np.float32)
+    priority = np.array([float(getattr(o, "priority_score_preexec", 0.5)) for o in obs], dtype=np.float32)
+    priority_conf = np.array([float(getattr(o, "priority_confidence_preexec", 0.0)) for o in obs], dtype=np.float32)
     c_mask = pc >= 0.5
     nc_mask = pnc > 0.5
     ceding_count = int(c_mask.sum())
@@ -181,12 +226,15 @@ def coercion_witness_label(
     s_notc = float(safe[nc_mask].mean()) if nonceding_count else float((pnc * safe).sum() / max(pnc.sum(), 1e-6))
     b_c = float(burden[c_mask].mean()) if ceding_count else float((pc * burden).sum() / max(pc.sum(), 1e-6))
     dep = max(0.0, s_c - s_notc)
-    label = np.clip(dep * max(0.0, b_c / max(eta_b, 1e-6)), 0.0, 1.0)
+    prio = float(np.nanmean(priority)) if priority.size else 0.5
+    prio_conf = float(np.nanmean(priority_conf)) if priority_conf.size else 0.0
+    label = np.clip(dep * max(0.0, b_c / max(eta_b, 1e-6)) * (1.0 - np.clip(prio, 0.0, 1.0)), 0.0, 1.0)
     if s_c > eta_safe and s_notc < eta_unsafe and b_c > eta_b:
-        label = max(float(label), 1.0)
-    # Confidence explicitly requires two-sided evidence.
+        label = max(float(label), float(1.0 - np.clip(prio, 0.0, 1.0)))
+    # Confidence explicitly requires two-sided evidence and reliable pre-exec priority.
     diversity = min(ceding_count, nonceding_count) / max(max(ceding_count, nonceding_count), 1)
-    confidence = float(np.clip(diversity * min(1.0, len(obs) / 4.0), 0.0, 1.0))
+    priority_evidence = np.clip(prio_conf, 0.0, 1.0)
+    confidence = float(np.clip(diversity * min(1.0, len(obs) / 4.0) * max(0.25, priority_evidence), 0.0, 1.0))
     return CoercionWitnessLabel(float(label), confidence, s_c, s_notc, b_c, ceding_count, nonceding_count)
 
 
@@ -208,5 +256,6 @@ def make_response_observation(*args, **kwargs) -> ResponseObservation:
         burden, _ = baseline_relative_burden(agent_traj, baseline_agent_traj, tau_agent, tau_base, dt=dt)
         margin = safety_margin(np.asarray(ego_traj), np.asarray(agent_traj))
         hp = high_pressure_label(burden, np.asarray(agent_traj), dt=dt)
-        return ResponseObservation(scene_id, root_hash, candidate_id, agent_id, variant_id, bp, int(np.argmax(bp)), np.asarray(agent_traj, dtype=np.float32), np.ones(len(agent_traj), dtype=bool), burden, margin, tau_agent, hp, prio, prio_conf)
+        return ResponseObservation(scene_id, root_hash, candidate_id, agent_id, variant_id, bp, int(np.argmax(bp)), np.asarray(agent_traj, dtype=np.float32), _valid_mask(np.asarray(agent_traj, dtype=np.float32)), burden, margin, tau_agent, hp, prio, prio_conf,
+            diagnostics={"interaction_features": dict(features) if isinstance(features, dict) else {}})
     return ResponseObservation(*args, **kwargs)

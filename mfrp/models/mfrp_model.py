@@ -132,6 +132,8 @@ class MFRPModel(nn.Module):
         b_c = (branch_prob[..., ceding] * burden_mu[..., ceding]).sum(-1) / p_c.clamp_min(1e-6)
         d_c = (s_c - s_nc).clamp_min(0.0)
         priority = batch.get("priority_score_preexec", batch.get("priority_score", torch.full_like(p_c, 0.5)))
+        priority_conf = batch.get("priority_confidence_preexec", torch.ones_like(priority))
+        priority = priority * priority_conf.clamp(0, 1) + 0.5 * (1.0 - priority_conf.clamp(0, 1))
         witness_features = torch.stack([p_c, s_c, s_nc, d_c, b_c, priority], dim=-1)
         kappa = self.witness(witness_features, h)
         result = {

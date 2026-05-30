@@ -1,6 +1,6 @@
 # Recommended MFRP command sequence
 
-This sequence follows the paper logic: same-root reactive data generation -> dataset diagnosis -> model training -> calibration -> testing -> deployment/switches. Replace `/path/to/...` with local WOMD/Waymax paths.
+This sequence follows the paper logic: same-root reactive data generation -> dataset diagnosis -> model training -> calibration -> testing -> deployment/selector. Replace `/path/to/...` with local WOMD/Waymax paths.
 
 ## 0. Environment
 
@@ -13,7 +13,7 @@ pip install -e .
 
 ## 1. Dataset generation
 
-The Waymax adapter now performs online same-root reactive rollouts from WOMD scenarios loaded by Waymax. It injects each ego candidate and rolls surrounding vehicles with IDM-style route-following policy variants. Log playback is still rejected as response supervision; an optional `adapter.rollout_cache` can be used only to override the online rollout with precomputed real reactive trajectories.
+The adapter builds same-root reactive data from WOMD scenarios loaded through Waymax. Ego candidates are now observation-only kinematic primitives generated from the root state, not perturbations of the logged SDC future. Surrounding vehicles are rolled with IDM-style route-following variants using a same-variant neutral baseline; this is still a WOMD-route IDM proxy rather than a full Waymax closed-loop environment. Log playback is rejected as response supervision; an optional `adapter.rollout_cache` can be used only to override the proxy rollout with precomputed reactive trajectories.
 
 ```bash
 python scripts/build_same_root_dataset.py \
@@ -29,7 +29,7 @@ python scripts/build_same_root_dataset.py \
   --config configs/data/mfrp_womd_waymax.yaml \
   --split val \
   --out outputs/datasets/mfrp_womd_waymax \
-  --womd-pattern "/path/to/womd/val/*.tfrecord" \
+  --womd-pattern "/data0/senzeyu2/dataset/WOMD/waymo_open_dataset_motion_v_1_3_1/uncompressed/tf_example//validation/*.tfrecord" \
   --adapter examples.mfrp_waymax_adapter:build_groups \
   --max-scenarios 2000 \
   --shard-size 8
@@ -38,7 +38,7 @@ python scripts/build_same_root_dataset.py \
   --config configs/data/mfrp_womd_waymax.yaml \
   --split test \
   --out outputs/datasets/mfrp_womd_waymax \
-  --womd-pattern "/path/to/womd/test/*.tfrecord" \
+  --womd-pattern "/data0/senzeyu2/dataset/WOMD/waymo_open_dataset_motion_v_1_3_1/uncompressed/tf_example//validation/*.tfrecord" \
   --adapter examples.mfrp_waymax_adapter:build_groups \
   --max-scenarios 2000 \
   --shard-size 8
@@ -87,6 +87,7 @@ python scripts/calibrate_mfrp.py \
   --out outputs/calibration/split_calibration.json \
   --beta 0.10 \
   --alpha 0.05 \
+  --selected-action \
   --device cuda
 ```
 
