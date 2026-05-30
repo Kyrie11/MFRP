@@ -87,7 +87,15 @@ def _maybe_get(obj: Any, *names: str, default: Any = None) -> Any:
 
 def _extract_sim_trajectory(state: Any) -> Any:
     # Avoid boolean-evaluating JAX/Waymax dataclasses or arrays.
-    for name in ("sim_trajectory", "log_trajectory", "trajectory"):
+    #
+    # For offline WOMD materialization the root scene must come from the logged
+    # scenario.  Waymax SimulatorState also carries a ``sim_trajectory`` field,
+    # but depending on Waymax version/config that field can contain only the
+    # simulator's current/initialized state and may mark most non-SDC tracks as
+    # invalid.  Preferring it caused every scanned train scene to be skipped as
+    # ``no_agents``.  Use log_trajectory first; the adapter still does not use
+    # logged futures as response labels, only as observed history / route refs.
+    for name in ("log_trajectory", "sim_trajectory", "trajectory"):
         val = _maybe_get(state, name)
         if val is not None:
             return val
@@ -480,12 +488,15 @@ def _select_relevant_agents(root: RootScene, cfg: dict[str, Any]) -> list[str]:
     radius = float(cfg.get("dataset", {}).get("relevant_radius_m", 60.0))
     max_agents = int(cfg.get("dataset", {}).get("max_agents_per_group", 8))
     ego = int(root.ego_index)
-    ego0 = root.history[ego, -1, :2]
+    ego_valid = root.history_mask[ego]
+    ego_idx = int(np.where(ego_valid)[0][-1]) if ego_valid.any() else root.history.shape[1] - 1
+    ego0 = root.history[ego, ego_idx, :2]
     candidates: list[tuple[float, str]] = []
     for i in range(root.history.shape[0]):
-        if i == ego or not root.history_mask[i, -1]:
+        if i == ego or not root.history_mask[i].any():
             continue
-        d = float(np.linalg.norm(root.history[i, -1, :2] - ego0))
+        last_i = int(np.where(root.history_mask[i])[0][-1])
+        d = float(np.linalg.norm(root.history[i, last_i, :2] - ego0))
         if d <= radius:
             candidates.append((d, str(i)))
     candidates.sort(key=lambda x: x[0])
@@ -825,128 +836,136 @@ def build_groups(
                 print(f"[MFRP] Reading WOMD shard {shard_no + 1}/{len(paths)}: {shard_path}")
             iterator = _make_iterator(shard_path)
             state_iter = tqdm(iterator, desc=f"scenarios shard {shard_no + 1}/{len(paths)}", unit="scene", leave=False) if tqdm else iterator
-            for state in state_iter:
-                if max_scenarios is not None and count >= max_scenarios:
-                    return
-                if max_source_scenarios is not None and raw_seen >= max_source_scenarios:
-                    if count == 0:
-                        raise RuntimeError(
-                            f"Scanned {raw_seen} raw WOMD states but materialized 0 groups. "
-                            "Relax dataset filters, check Waymax path/config, or raise --max-source-scenarios."
-                        )
-                    return
-                idx = global_idx
-                global_idx += 1
-                raw_seen += 1
-                root, arr, ego0_world = _make_root_scene(state, split, idx, config)
-                if not _include_in_requested_split(root.scene_id, split):
-                    if progress is not None:
-                        progress.set_postfix(raw=raw_seen, split=split_seen, groups=count, refresh=False)
-                    continue
-                split_seen += 1
-                candidates = _generate_candidates(root, arr, ego0_world, config)
-                agents = _select_relevant_agents(root, config)
-                if not agents:
-                    skipped_no_agents += 1
-                    if progress is not None:
-                        progress.set_postfix(raw=raw_seen, split=split_seen, no_agents=skipped_no_agents, groups=count, refresh=False)
-                    continue
-                if len(candidates) < 2:
-                    skipped_too_few_candidates += 1
-                    if progress is not None:
-                        progress.set_postfix(raw=raw_seen, split=split_seen, few_cands=skipped_too_few_candidates, groups=count, refresh=False)
-                    continue
-                support, query = _support_query_split(candidates, config)
-                group = SameRootGroup(
-                    root_scene=root,
-                    candidates=candidates,
-                    relevant_agent_ids=agents,
-                    rollout_variants=[v.name for v in variants],
-                    observations={},
-                    metadata={
-                        "support_candidate_ids": support,
-                        "query_candidate_ids": query,
-                        "uses_log_playback_for_response": False,
-                        "reactive_rollout_backend": "womd_route_idm_proxy_same_root" if generate_online else "cache",
-                        "candidate_generator": "observed_root_kinematic_primitives",
-                        "neutral_baseline": "same_variant_neutral_candidate_rollout",
-                        "adapter": "examples.mfrp_waymax_adapter",
-                        "max_boundary_pairs_per_agent": int(data_cfg.get("max_boundary_pairs_per_agent", 48)),
-                    },
-                )
-                all_obs = []
-                neutral_candidate = next((cand for cand in candidates if cand.candidate_id == "neutral"), candidates[0])
-                # Per (agent, variant) route references and same-policy neutral baselines.
-                route_refs: dict[str, np.ndarray] = {}
-                preexec_refs: dict[str, np.ndarray] = {}
-                neutral_baselines: dict[tuple[str, str], np.ndarray] = {}
-                for aid in agents:
-                    route_refs[aid] = _agent_neutral_future(root, arr, ego0_world, aid, future_steps)
-                    preexec_refs[aid] = _preexec_agent_reference(root, aid, future_steps)
-                    for v in variants:
-                        neutral_baselines[(aid, v.name)] = _reactive_rollout_for_agent(root, aid, route_refs[aid], neutral_candidate.trajectory, v)
-                for c in candidates:
-                    c_meta = dict(c.metadata)
-                    c_meta.setdefault("agent_features", {})
-                    for aid in agents:
-                        preexec_ref = preexec_refs[aid]
-                        pre_feat = _make_agent_interaction_features(c, preexec_ref, preexec_ref, root.dt)
-                        pre_feat["has_route_context"] = root.route_features is not None or (root.route_context is not None and root.route_context.route_features is not None)
-                        pre_feat["has_traffic_controls"] = root.traffic_controls is not None
-                        pr = compute_priority_score(pre_feat)
-                        c_meta["agent_features"][aid] = {"interaction_features": np.array([
-                            pre_feat.get("tau_ego_in", 0.0), pre_feat.get("tau_i0_in", 0.0), pre_feat.get("entry_time_gap", 0.0),
-                            pre_feat.get("min_distance", 0.0), pr.score, pr.confidence,
-                        ], dtype=np.float32), "priority_source": "observed_history_constant_velocity"}
-                        for v in variants:
-                            route_ref = route_refs[aid]
-                            baseline_traj = neutral_baselines[(aid, v.name)]
-                            agent_traj = _load_cached_rollout(rollout_cache, root.scene_id, c.candidate_id, v.name, aid)
-                            if agent_traj is None:
-                                if not generate_online:
-                                    raise RuntimeError(
-                                        "Missing rollout_cache item and adapter.generate_online_rollouts=false. "
-                                        "Either enable online WOMD-route IDM rollout or provide cache files."
-                                    )
-                                agent_traj = baseline_traj if c.candidate_id == neutral_candidate.candidate_id else _reactive_rollout_for_agent(root, aid, route_ref, c.trajectory, v)
-                            n = min(len(c.trajectory), len(agent_traj), len(baseline_traj))
-                            inter_feat = _make_agent_interaction_features(c, baseline_traj[:n], agent_traj[:n], root.dt)
-                            obs = make_response_observation(
-                                root.scene_id, root.root_hash, c.candidate_id, aid, v.name,
-                                c.trajectory[:n], agent_traj[:n], baseline_traj[:n], inter_feat,
-                                pr.score, pr.confidence, dt=root.dt,
+            try:
+                for state in state_iter:
+                    if max_scenarios is not None and count >= max_scenarios:
+                        return
+                    if max_source_scenarios is not None and raw_seen >= max_source_scenarios:
+                        if count == 0:
+                            raise RuntimeError(
+                                f"Scanned {raw_seen} raw WOMD states but materialized 0 groups. "
+                                "Relax dataset filters, check Waymax path/config, or raise --max-source-scenarios."
                             )
-                            group.observations[(c.candidate_id, aid, v.name)] = obs
-                            all_obs.append(obs)
-                    # dataclass is frozen; replace candidate metadata with preexec per-agent features.
-                    object.__setattr__(c, "metadata", c_meta)
-                # Fill CW labels back into observations and group metadata for tensor collation.
-                from mfrp.data.label_extraction import coercion_witness_label
-                cw_labels: dict[tuple[str, str], Any] = {}
-                for c in candidates:
+                        return
+                    idx = global_idx
+                    global_idx += 1
+                    raw_seen += 1
+                    root, arr, ego0_world = _make_root_scene(state, split, idx, config)
+                    if not _include_in_requested_split(root.scene_id, split):
+                        if progress is not None:
+                            progress.set_postfix(raw=raw_seen, split=split_seen, groups=count, refresh=False)
+                        continue
+                    split_seen += 1
+                    candidates = _generate_candidates(root, arr, ego0_world, config)
+                    agents = _select_relevant_agents(root, config)
+                    if not agents:
+                        skipped_no_agents += 1
+                        if progress is not None:
+                            progress.set_postfix(raw=raw_seen, split=split_seen, no_agents=skipped_no_agents, groups=count, refresh=False)
+                        continue
+                    if len(candidates) < 2:
+                        skipped_too_few_candidates += 1
+                        if progress is not None:
+                            progress.set_postfix(raw=raw_seen, split=split_seen, few_cands=skipped_too_few_candidates, groups=count, refresh=False)
+                        continue
+                    support, query = _support_query_split(candidates, config)
+                    group = SameRootGroup(
+                        root_scene=root,
+                        candidates=candidates,
+                        relevant_agent_ids=agents,
+                        rollout_variants=[v.name for v in variants],
+                        observations={},
+                        metadata={
+                            "support_candidate_ids": support,
+                            "query_candidate_ids": query,
+                            "uses_log_playback_for_response": False,
+                            "reactive_rollout_backend": "womd_route_idm_proxy_same_root" if generate_online else "cache",
+                            "candidate_generator": "observed_root_kinematic_primitives",
+                            "neutral_baseline": "same_variant_neutral_candidate_rollout",
+                            "adapter": "examples.mfrp_waymax_adapter",
+                            "max_boundary_pairs_per_agent": int(data_cfg.get("max_boundary_pairs_per_agent", 48)),
+                        },
+                    )
+                    all_obs = []
+                    neutral_candidate = next((cand for cand in candidates if cand.candidate_id == "neutral"), candidates[0])
+                    # Per (agent, variant) route references and same-policy neutral baselines.
+                    route_refs: dict[str, np.ndarray] = {}
+                    preexec_refs: dict[str, np.ndarray] = {}
+                    neutral_baselines: dict[tuple[str, str], np.ndarray] = {}
                     for aid in agents:
-                        lab = coercion_witness_label(all_obs, c.candidate_id, aid, root.root_hash, root.scene_id)
-                        cw_labels[(c.candidate_id, aid)] = lab
+                        route_refs[aid] = _agent_neutral_future(root, arr, ego0_world, aid, future_steps)
+                        preexec_refs[aid] = _preexec_agent_reference(root, aid, future_steps)
                         for v in variants:
-                            key = (c.candidate_id, aid, v.name)
-                            obs = group.observations.get(key)
-                            if obs is not None:
-                                object.__setattr__(obs, "cw_soft_label", float(lab.soft_label))
-                                object.__setattr__(obs, "cw_confidence", float(lab.confidence))
-                group.metadata["cw_labels"] = {f"{k[0]}|{k[1]}": dataclasses.asdict(v) if dataclasses.is_dataclass(v) else str(v) for k, v in cw_labels.items()}
-                group.boundary_pairs = _boundary_pairs(group)
-                if not group.observations:
-                    continue
-                count += 1
-                if progress is not None:
-                    if max_scenarios is not None:
-                        progress.update(1)
-                    else:
+                            neutral_baselines[(aid, v.name)] = _reactive_rollout_for_agent(root, aid, route_refs[aid], neutral_candidate.trajectory, v)
+                    for c in candidates:
+                        c_meta = dict(c.metadata)
+                        c_meta.setdefault("agent_features", {})
+                        for aid in agents:
+                            preexec_ref = preexec_refs[aid]
+                            pre_feat = _make_agent_interaction_features(c, preexec_ref, preexec_ref, root.dt)
+                            pre_feat["has_route_context"] = root.route_features is not None or (root.route_context is not None and root.route_context.route_features is not None)
+                            pre_feat["has_traffic_controls"] = root.traffic_controls is not None
+                            pr = compute_priority_score(pre_feat)
+                            c_meta["agent_features"][aid] = {"interaction_features": np.array([
+                                pre_feat.get("tau_ego_in", 0.0), pre_feat.get("tau_i0_in", 0.0), pre_feat.get("entry_time_gap", 0.0),
+                                pre_feat.get("min_distance", 0.0), pr.score, pr.confidence,
+                            ], dtype=np.float32), "priority_source": "observed_history_constant_velocity"}
+                            for v in variants:
+                                route_ref = route_refs[aid]
+                                baseline_traj = neutral_baselines[(aid, v.name)]
+                                agent_traj = _load_cached_rollout(rollout_cache, root.scene_id, c.candidate_id, v.name, aid)
+                                if agent_traj is None:
+                                    if not generate_online:
+                                        raise RuntimeError(
+                                            "Missing rollout_cache item and adapter.generate_online_rollouts=false. "
+                                            "Either enable online WOMD-route IDM rollout or provide cache files."
+                                        )
+                                    agent_traj = baseline_traj if c.candidate_id == neutral_candidate.candidate_id else _reactive_rollout_for_agent(root, aid, route_ref, c.trajectory, v)
+                                n = min(len(c.trajectory), len(agent_traj), len(baseline_traj))
+                                inter_feat = _make_agent_interaction_features(c, baseline_traj[:n], agent_traj[:n], root.dt)
+                                obs = make_response_observation(
+                                    root.scene_id, root.root_hash, c.candidate_id, aid, v.name,
+                                    c.trajectory[:n], agent_traj[:n], baseline_traj[:n], inter_feat,
+                                    pr.score, pr.confidence, dt=root.dt,
+                                )
+                                group.observations[(c.candidate_id, aid, v.name)] = obs
+                                all_obs.append(obs)
+                        # dataclass is frozen; replace candidate metadata with preexec per-agent features.
+                        object.__setattr__(c, "metadata", c_meta)
+                    # Fill CW labels back into observations and group metadata for tensor collation.
+                    from mfrp.data.label_extraction import coercion_witness_label
+                    cw_labels: dict[tuple[str, str], Any] = {}
+                    for c in candidates:
+                        for aid in agents:
+                            lab = coercion_witness_label(all_obs, c.candidate_id, aid, root.root_hash, root.scene_id)
+                            cw_labels[(c.candidate_id, aid)] = lab
+                            for v in variants:
+                                key = (c.candidate_id, aid, v.name)
+                                obs = group.observations.get(key)
+                                if obs is not None:
+                                    object.__setattr__(obs, "cw_soft_label", float(lab.soft_label))
+                                    object.__setattr__(obs, "cw_confidence", float(lab.confidence))
+                    group.metadata["cw_labels"] = {f"{k[0]}|{k[1]}": dataclasses.asdict(v) if dataclasses.is_dataclass(v) else str(v) for k, v in cw_labels.items()}
+                    group.boundary_pairs = _boundary_pairs(group)
+                    if not group.observations:
+                        continue
+                    count += 1
+                    if progress is not None:
+                        if max_scenarios is not None:
+                            progress.update(1)
+                        else:
+                            progress.set_postfix(raw=raw_seen, split=split_seen, groups=count, refresh=False)
                         progress.set_postfix(raw=raw_seen, split=split_seen, groups=count, refresh=False)
-                    progress.set_postfix(raw=raw_seen, split=split_seen, groups=count, refresh=False)
-                if tqdm is not None:
-                    state_iter.set_postfix(raw=raw_seen, split=split_seen, groups=count, target=max_scenarios)
-                yield group
+                    if tqdm is not None:
+                        state_iter.set_postfix(raw=raw_seen, split=split_seen, groups=count, target=max_scenarios)
+                    yield group
+            except Exception as e:
+                msg = str(e)
+                typ = type(e).__name__
+                if "DataLossError" in typ or "DATA_LOSS" in msg or "corrupted record" in msg:
+                    print(f"[MFRP] Skipping unreadable WOMD shard due to TensorFlow data loss: {shard_path} ({typ}: {msg})")
+                    continue
+                raise
             if progress is not None and max_scenarios is None:
                 progress.update(1)
     finally:
