@@ -15,6 +15,16 @@ def main() -> None:
     p.add_argument("--adapter", default=None, help="Python adapter callable in module:function format")
     p.add_argument("--input-npz", default=None)
     p.add_argument("--max-scenarios", type=int, default=None)
+    p.add_argument(
+        "--max-source-scenarios",
+        type=int,
+        default=None,
+        help=(
+            "Optional hard cap on raw WOMD simulator states scanned before giving up. "
+            "This is useful for quick paper checks when filters are too strict or the "
+            "Waymax dataloader unexpectedly streams more than one physical TFRecord."
+        ),
+    )
     p.add_argument("--num-workers", type=int, default=1)
     p.add_argument("--shard-size", type=int, default=8)
     p.add_argument("--debug-allow-no-support", action="store_true")
@@ -51,7 +61,18 @@ def main() -> None:
     if not args.womd_pattern:
         raise SystemExit("Missing --womd-pattern. Refusing to create placeholder data.")
     adapter = load_adapter(args.adapter)
-    written = materialize_with_adapter(adapter, split=args.split, out_dir=args.out, womd_pattern=args.womd_pattern, config=cfg, max_scenarios=args.max_scenarios, shard_size=args.shard_size, num_workers=args.num_workers, debug_allow_no_support=args.debug_allow_no_support)
+    written = materialize_with_adapter(
+        adapter,
+        split=args.split,
+        out_dir=args.out,
+        womd_pattern=args.womd_pattern,
+        config=cfg,
+        max_scenarios=args.max_scenarios,
+        max_source_scenarios=args.max_source_scenarios,
+        shard_size=args.shard_size,
+        num_workers=args.num_workers,
+        debug_allow_no_support=args.debug_allow_no_support,
+    )
     (out / "BUILD_SPEC.json").write_text(json.dumps({**spec, "status": "materialized", "shards": [str(p) for p in written]}, indent=2, default=str), encoding="utf-8")
     print("\n".join(str(p) for p in written))
 

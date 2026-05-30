@@ -16,31 +16,36 @@ pip install -e .
 The adapter builds same-root reactive data from WOMD scenarios loaded through Waymax. Ego candidates are now observation-only kinematic primitives generated from the root state, not perturbations of the logged SDC future. Surrounding vehicles are rolled with IDM-style route-following variants using a same-variant neutral baseline; this is still a WOMD-route IDM proxy rather than a full Waymax closed-loop environment. Log playback is rejected as response supervision; an optional `adapter.rollout_cache` can be used only to override the proxy rollout with precomputed reactive trajectories.
 
 ```bash
-python scripts/build_same_root_dataset.py \
+export WOMD_TRAIN="/data0/senzeyu2/dataset/WOMD/waymo_open_dataset_motion_v_1_3_1/uncompressed/tf_example/training/*.tfrecord*"
+export WOMD_VAL="/data0/senzeyu2/dataset/WOMD/waymo_open_dataset_motion_v_1_3_1/uncompressed/tf_example/validation/*.tfrecord*"
+```
+
+```bash
+python -m scripts.build_same_root_dataset \
   --config configs/data/mfrp_womd_waymax.yaml \
   --split train \
-  --out outputs/datasets/mfrp_womd_waymax \
-  --womd-pattern "/data0/senzeyu2/dataset/WOMD/waymo_open_dataset_motion_v_1_3_1/uncompressed/tf_example//training/*.tfrecord" \
+  --out outputs/papercheck_dataset \
+  --womd-pattern "$WOMD_TRAIN" \
   --adapter examples.mfrp_waymax_adapter:build_groups \
-  --max-scenarios 20000 \
+  --max-scenarios 64 \
   --shard-size 8
 
-python scripts/build_same_root_dataset.py \
+python -m scripts.build_same_root_dataset \
   --config configs/data/mfrp_womd_waymax.yaml \
   --split val \
-  --out outputs/datasets/mfrp_womd_waymax \
-  --womd-pattern "/data0/senzeyu2/dataset/WOMD/waymo_open_dataset_motion_v_1_3_1/uncompressed/tf_example//validation/*.tfrecord" \
+  --out outputs/papercheck_dataset \
+  --womd-pattern "$WOMD_VAL" \
   --adapter examples.mfrp_waymax_adapter:build_groups \
-  --max-scenarios 2000 \
+  --max-scenarios 32 \
   --shard-size 8
 
-python scripts/build_same_root_dataset.py \
+python -m scripts.build_same_root_dataset \
   --config configs/data/mfrp_womd_waymax.yaml \
   --split test \
-  --out outputs/datasets/mfrp_womd_waymax \
-  --womd-pattern "/data0/senzeyu2/dataset/WOMD/waymo_open_dataset_motion_v_1_3_1/uncompressed/tf_example//validation/*.tfrecord" \
+  --out outputs/papercheck_dataset \
+  --womd-pattern "$WOMD_VAL" \
   --adapter examples.mfrp_waymax_adapter:build_groups \
-  --max-scenarios 2000 \
+  --max-scenarios 32 \
   --shard-size 8
 ```
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import inspect
 from collections.abc import Callable, Iterable
 from pathlib import Path
 from typing import Any
@@ -39,6 +40,7 @@ def materialize_with_adapter(
     womd_pattern: str,
     config: dict[str, Any],
     max_scenarios: int | None = None,
+    max_source_scenarios: int | None = None,
     shard_size: int = 8,
     num_workers: int = 1,
     debug_allow_no_support: bool = False,
@@ -47,7 +49,22 @@ def materialize_with_adapter(
         raise ValueError("womd_pattern is required; refusing to create placeholder data")
     out_root = Path(out_dir) / split
     out_root.mkdir(parents=True, exist_ok=True)
-    groups = adapter(womd_pattern=womd_pattern, split=split, config=config, max_scenarios=max_scenarios, num_workers=num_workers)
+    adapter_kwargs = dict(
+        womd_pattern=womd_pattern,
+        split=split,
+        config=config,
+        max_scenarios=max_scenarios,
+        num_workers=num_workers,
+    )
+    # Keep third-party adapters working while allowing the official Waymax
+    # adapter to distinguish "groups to materialize" from "raw states scanned".
+    try:
+        sig = inspect.signature(adapter)
+        if "max_source_scenarios" in sig.parameters:
+            adapter_kwargs["max_source_scenarios"] = max_source_scenarios
+    except (TypeError, ValueError):
+        pass
+    groups = adapter(**adapter_kwargs)
     written: list[Path] = []
     cfd = int(config.get("tensor", {}).get("candidate_feature_dim", config.get("model", {}).get("candidate_feature_dim", 20)))
     sfd = int(config.get("tensor", {}).get("scene_feature_dim", config.get("model", {}).get("scene_feature_dim", 32)))
